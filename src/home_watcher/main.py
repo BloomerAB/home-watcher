@@ -51,6 +51,9 @@ class AppState:
     presence: UnifiClientsLookup
     notifier: NtfyNotifier
     ws_task: asyncio.Task[None] | None = None
+    # Dedup state: camera_id -> last_notification_unixtime
+    last_alerted: dict[str, float] = {}
+    dedup_window_seconds: float = 30.0
 
 
 state = AppState()
@@ -156,6 +159,18 @@ async def _handle_event(update: ProtectUpdate) -> None:
         family_home=family_home,
         face_count=len(faces),
     )
+
+    # Dedup: Protect emits two WS messages per motion (event/add + camera/update)
+    # which both translate to the same user-visible alert. Skip if we already
+    # alerted for this camera within dedup_window_seconds.
+    import time as _time
+    now_ts = _time.time()
+    last = state.last_alerted.get(camera_id, 0.0)
+    if now_ts - last < state.dedup_window_seconds:
+        log.info("notification_deduped", camera=camera_name,
+                 seconds_since_last=round(now_ts - last, 1))
+        return
+    state.last_alerted[camera_id] = now_ts
 
     await _send_notification(result, camera_id, camera_name, sd_types, snapshot)
 
