@@ -51,11 +51,18 @@ class FaceRecognizer:
     def known_subjects(self) -> list[str]:
         return list(self._embeddings.keys())
 
-    def recognize(self, image_bytes: bytes) -> list[DetectedFace]:
+    def recognize(self, image_bytes: bytes, *, upsample: int = 1) -> list[DetectedFace]:
+        """Detect + match faces in a JPEG.
+
+        upsample=1 (default, fast) — looks for faces ≥80px on raw image
+        upsample=2 (slower) — looks for faces ≥40px (good for small thumbnails)
+        """
         import face_recognition
 
         image = self._load_image(image_bytes)
-        locations = face_recognition.face_locations(image, model="hog")
+        locations = face_recognition.face_locations(
+            image, model="hog", number_of_times_to_upsample=upsample
+        )
         if not locations:
             return []
         encodings = face_recognition.face_encodings(image, known_face_locations=locations)

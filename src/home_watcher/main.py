@@ -609,7 +609,8 @@ async def backfill_old_events(
         events_with_thumbnail += 1
 
         try:
-            detected = s.recognizer.recognize(thumb)
+            # Thumbnails are 360x360 — upsample=2 lets dlib find faces down to ~40px.
+            detected = s.recognizer.recognize(thumb, upsample=2)
         except Exception as exc:  # noqa: BLE001
             log.warning("backfill_face_recog_failed", event_id=event_id, error=str(exc))
             continue
@@ -622,7 +623,9 @@ async def backfill_old_events(
             if face.is_known:
                 events_with_known_face += 1
                 continue
-            if face.width_px < s.settings.min_face_width_px:
+            # Lower threshold for backfill: 360x360 thumbnails mean even small
+            # faces are worth keeping for training data.
+            if face.width_px < 30:
                 continue
             if face.embedding is None:
                 continue
