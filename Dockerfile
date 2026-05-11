@@ -37,6 +37,12 @@ WORKDIR /build/models
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     YOLO_CONFIG_DIR=/tmp/Ultralytics \
     python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+
+# Pre-download OSNet x0_25 (TorchReID) weights so first body Re-ID inference
+# doesn't need to fetch from network
+RUN PYTHONPATH=/install/lib/python3.13/site-packages \
+    python -c "import torchreid; torchreid.models.build_model('osnet_x0_25', num_classes=1000, pretrained=True)" \
+    || echo "torchreid pretrained download may have failed; will retry at runtime"
 WORKDIR /build
 
 # ---------- runtime ----------

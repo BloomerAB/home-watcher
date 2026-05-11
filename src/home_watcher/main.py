@@ -25,6 +25,8 @@ from .decision.scorer import (
     ScoringContext,
     decide,
 )
+from .bodies.db import BodyDB
+from .bodies.reid import BodyReID
 from .faces.db import FaceDB
 from .faces.recognizer import FaceRecognizer, save_training_photo
 from .faces.unknown_db import UnknownFaceDB
@@ -47,6 +49,8 @@ class AppState:
     recognizer: FaceRecognizer
     pet_db: PetDB
     pet_detector: PetDetector
+    body_db: BodyDB
+    body_reid: BodyReID
     protect: ProtectClient
     presence: UnifiClientsLookup
     notifier: NtfyNotifier
@@ -110,18 +114,19 @@ async def _handle_event(update: ProtectUpdate) -> None:
         log.info("inferred_person_from_face", camera=camera_name,
                  face_count=len(faces))
 
-    # If still no person classification, fall back to YOLO person detection.
-    # Outdoor face_recognition often misses faces at distance/angle, but YOLO
-    # can detect persons reliably from body shape.
-    if "person" not in sd_types and "animal" not in sd_types:
-        try:
-            person_count = state.pet_detector.detect_persons(snapshot)
-            if person_count > 0:
-                sd_types = [*sd_types, "person"]
-                log.info("inferred_person_from_yolo", camera=camera_name,
-                         person_count=person_count)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("yolo_person_detect_failed", error=str(exc))
+    # YOLO person detection — even if face_rec already inferred person, we want
+    # the bboxes so we can run Body Re-ID on each person region.
+    body_matches: list[str] = []
+    try:
+        person_bboxes = state.pet_detector.detect_person_bboxes(snapshot)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("yolo_person_detect_failed", error=str(exc))
+        person_bboxes = []
+
+    if person_bboxes and "person" not in sd_types:
+        sd_types = [*sd_types, "person"]
+        log.info("inferred_person_from_yolo", camera=camera_name,
+                 person_count=len(person_bboxes))
 
     if not sd_types:
         log.info("motion_no_useful_classification", camera=camera_name)
@@ -130,6 +135,11 @@ async def _handle_event(update: ProtectUpdate) -> None:
     log.info("motion_event", camera=camera_name, types=sd_types)
     if faces:
         _save_unknown_faces(faces, snapshot, camera_name)
+
+    # Body Re-ID: crop each person bbox, extract embedding, match against known.
+    # Save unknown bodies to queue for labeling.
+    if person_bboxes:
+        body_matches = _identify_bodies(person_bboxes, snapshot, camera_name)
     if "animal" in sd_types:
         _detect_and_save_pets(snapshot, camera_name)
     family_home = await state.presence.family_at_home()
@@ -143,6 +153,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
         now=datetime.now(),
         family_at_home=family_home,
         camera_cfg=camera_cfg,
+        body_matches=body_matches,
+        body_person_count=len(person_bboxes),
     )
     result = decide(
         ctx,
@@ -202,6 +214,65 @@ async def _send_notification(
             image_bytes=snapshot,
             click_url=click_url,
         )
+
+
+def _identify_bodies(
+    person_bboxes: list[tuple[tuple[int, int, int, int], float]],
+    snapshot: bytes,
+    camera: str,
+) -> list[str]:
+    """Run Body Re-ID on each detected person. Return list of matched subjects.
+    Save unknown bodies to queue for labeling."""
+    from datetime import UTC, datetime
+
+    matches: list[str] = []
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    body_dir = state.settings.data_dir / "unknown_bodies"
+    body_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, (bbox, conf) in enumerate(person_bboxes):
+        try:
+            crop_bytes = PetDetector.crop(snapshot, bbox, pad=10)
+            embedding = state.body_reid.embed(crop_bytes)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("body_reid_failed", error=str(exc))
+            continue
+
+        result = state.body_reid.match(embedding)
+        top, right, bottom, left = bbox
+        width = right - left
+        height = bottom - top
+
+        if result.is_known:
+            log.info(
+                "body_matched",
+                camera=camera,
+                subject=result.matched_subject,
+                similarity=round(result.similarity, 3),
+            )
+            assert result.matched_subject is not None
+            matches.append(result.matched_subject)
+            continue
+
+        crop_filename = f"{timestamp}_{camera}_body_{idx}_crop.jpg"
+        snap_filename = f"{timestamp}_{camera}_body_{idx}_snap.jpg"
+        (body_dir / crop_filename).write_bytes(crop_bytes)
+        (body_dir / snap_filename).write_bytes(snapshot)
+        state.body_db.add_unknown(
+            camera=camera,
+            crop_filename=crop_filename,
+            snapshot_filename=snap_filename,
+            bbox=bbox,
+            width_px=width,
+            height_px=height,
+            embedding=embedding,
+        )
+        log.info(
+            "body_unknown_saved",
+            camera=camera,
+            best_similarity=round(result.similarity, 3),
+        )
+    return matches
 
 
 def _detect_and_save_pets(snapshot: bytes, camera: str) -> None:
@@ -308,6 +379,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     state.pet_db = PetDB(settings.data_dir / "pets.db")
     state.pet_detector = PetDetector()
+    state.body_db = BodyDB(settings.data_dir / "bodies.db")
+    state.body_reid = BodyReID()
+    state.body_reid.reload(state.body_db.all_known_by_subject())
     state.protect = ProtectClient(
         host=settings.unifi_host,
         username=settings.unifi_user,
@@ -564,6 +638,82 @@ async def discard_unknown_pet(
     return {"status": "discarded"}
 
 
+@app.get("/api/bodies/subjects")
+async def list_body_subjects(s: Annotated[AppState, Depends(_get_state)]) -> dict[str, int]:
+    return s.body_db.list_known_subjects()
+
+
+@app.get("/api/bodies/unknown")
+async def list_unknown_bodies(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 100
+) -> list[dict[str, object]]:
+    rows = s.body_db.list_unlabeled(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at.isoformat(),
+            "camera": r.camera,
+            "width_px": r.width_px,
+            "height_px": r.height_px,
+            "crop_url": f"/api/bodies/unknown/{r.id}/crop",
+            "snapshot_url": f"/api/bodies/unknown/{r.id}/snapshot",
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/bodies/unknown/{body_id}/crop")
+async def get_unknown_body_crop(
+    body_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.body_db.get_unknown(body_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_bodies" / row.crop_filename)
+
+
+@app.get("/api/bodies/unknown/{body_id}/snapshot")
+async def get_unknown_body_snapshot(
+    body_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.body_db.get_unknown(body_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_bodies" / row.snapshot_filename)
+
+
+@app.post("/api/bodies/unknown/{body_id}/label")
+async def label_unknown_body(
+    body_id: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.body_db.get_unknown(body_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    db_id = s.body_db.add_known(subject, row.crop_filename, row.embedding)
+    s.body_db.mark_labeled(body_id)
+    s.body_reid.reload(s.body_db.all_known_by_subject())
+    return {"known_id": db_id, "subject": subject}
+
+
+@app.delete("/api/bodies/unknown/{body_id}")
+async def discard_unknown_body(
+    body_id: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.body_db.get_unknown(body_id) is None:
+        raise HTTPException(status_code=404)
+    s.body_db.mark_discarded(body_id)
+    return {"status": "discarded"}
+
+
 @app.post("/api/backfill")
 async def backfill_old_events(
     s: Annotated[AppState, Depends(_get_state)],
@@ -704,7 +854,11 @@ _INLINE_HTML = """<!doctype html>
 </head>
 <body>
 
-<h1>Okända ansikten</h1>
+<h1>Okända personer (kropp)</h1>
+<div class="known" id="known-bodies"></div>
+<div class="grid" id="grid-bodies"></div>
+
+<h2>Okända ansikten</h2>
 <div class="known" id="known-faces"></div>
 <div class="grid" id="grid-faces"></div>
 
@@ -795,12 +949,45 @@ _INLINE_HTML = """<!doctype html>
     await loadPets();
   }
 
+  async function loadBodies() {
+    const r = await fetch('/api/bodies/unknown');
+    const items = await r.json();
+    const grid = document.getElementById('grid-bodies');
+    grid.innerHTML = items.length === 0 ? '<p>Inga okända personer i kön.</p>' : '';
+    for (const b of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${b.crop_url}" alt="body">
+        <div class="meta">${b.camera} — ${new Date(b.detected_at).toLocaleString('sv-SE')} — ${b.width_px}×${b.height_px}px</div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Malin)" id="bn-${b.id}">
+          <button onclick="labelBody(${b.id})">Spara</button>
+        </div>
+        <div class="row"><button class="secondary" onclick="discardBody(${b.id})">Skippa</button></div>
+        <details><summary>Full bild</summary><img src="${b.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+  async function labelBody(id) {
+    const name = document.getElementById('bn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/bodies/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
+  }
+  async function discardBody(id) {
+    await fetch(`/api/bodies/unknown/${id}`, {method: 'DELETE'});
+    await loadBodies();
+  }
+
   async function refresh() {
     await Promise.all([
       loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
       loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
+      loadKnown('/api/bodies/subjects', document.getElementById('known-bodies'), 'Tränade personer'),
       loadFaces(),
       loadPets(),
+      loadBodies(),
     ]);
   }
   refresh();

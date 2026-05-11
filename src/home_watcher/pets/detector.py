@@ -93,6 +93,19 @@ class PetDetector:
         """Returns count of persons detected above min_confidence."""
         return sum(1 for name, _, _ in self._run(image_bytes) if name == PERSON_CLASS)
 
+    def detect_person_bboxes(
+        self, image_bytes: bytes
+    ) -> list[tuple[tuple[int, int, int, int], float]]:
+        """Returns list of (bbox, confidence) for each person detected.
+
+        bbox is (top, right, bottom, left) in pixels. Same convention as DetectedPet.
+        """
+        return [
+            (bbox, conf)
+            for name, conf, bbox in self._run(image_bytes)
+            if name == PERSON_CLASS
+        ]
+
     def detect_all(self, image_bytes: bytes) -> dict[str, int]:
         """Returns map of {class_name: count} for all relevant classes."""
         counts: dict[str, int] = {}

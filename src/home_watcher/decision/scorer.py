@@ -30,6 +30,11 @@ class ScoringContext:
     now: datetime
     family_at_home: bool
     camera_cfg: CameraConfig
+    body_matches: list[str] = field(default_factory=list)
+    """Subject names matched by Body Re-ID (e.g. ['Malin']). Empty if no
+    person bboxes matched a known body."""
+    body_person_count: int = 0
+    """Total persons detected by YOLO (matched + unmatched)."""
 
 
 @dataclass
@@ -74,22 +79,40 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
     # 3. Person detected — score from signals
     score = 0.0
 
-    # 3a. Face recognition
+    # 3a. Face + Body Re-ID — known family check
     usable_faces = [f for f in ctx.faces if f.width_px >= min_face_width_px]
-    if usable_faces and all(f.is_known for f in usable_faces):
+    all_faces_known = bool(usable_faces) and all(f.is_known for f in usable_faces)
+    any_unknown_face = bool(usable_faces) and any(not f.is_known for f in usable_faces)
+    all_bodies_matched = (
+        ctx.body_person_count > 0 and len(ctx.body_matches) == ctx.body_person_count
+    )
+
+    # If we have face matches with no unknowns OR all bodies matched (and no
+    # unknown face on top) → known family scenario, silent.
+    if (all_faces_known and not any_unknown_face) or (
+        all_bodies_matched and not any_unknown_face
+    ):
+        subjects: list[str] = []
+        if usable_faces:
+            subjects.extend(f.matched_subject for f in usable_faces if f.matched_subject)
+        subjects.extend(ctx.body_matches)
+        unique_subjects = list(dict.fromkeys(subjects))
         return DecisionResult(
             decision=Decision.KNOWN_FAMILY,
             score=0.0,
-            reasons=[f"all faces known: {', '.join(f.matched_subject or '?' for f in usable_faces)}"],
-            matched_subjects=[f.matched_subject for f in usable_faces if f.matched_subject],
+            reasons=[f"recognized: {', '.join(unique_subjects) or 'family'}"],
+            matched_subjects=unique_subjects,
         )
 
-    if usable_faces and any(not f.is_known for f in usable_faces):
+    if any_unknown_face:
         score += 0.7
         reasons.append(f"unknown face detected (width≥{min_face_width_px}px)")
-    elif not ctx.faces:
+    elif ctx.body_person_count > 0 and not ctx.body_matches:
+        score += 0.5
+        reasons.append("person body detected but did not match any known family")
+    elif not ctx.faces and ctx.body_person_count == 0:
         score += 0.3
-        reasons.append("no face detected — person present but face hidden/too far")
+        reasons.append("no face or body detected — person present but unclear")
     else:
         score += 0.3
         reasons.append(f"only small faces (<{min_face_width_px}px)")
