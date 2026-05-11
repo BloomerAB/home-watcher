@@ -26,6 +26,8 @@ class DetectedFace:
     matched_subject: str | None
     distance: float
     """Cosine distance to closest known embedding. Lower = better match."""
+    embedding: np.ndarray | None = None
+    """The face encoding (128-float vector). None in tests/stubs."""
 
     @property
     def is_known(self) -> bool:
@@ -69,9 +71,30 @@ class FaceRecognizer:
                     width_px=width,
                     matched_subject=matched,
                     distance=distance,
+                    embedding=encoding,
                 )
             )
         return results
+
+    @staticmethod
+    def crop_face(image_bytes: bytes, bbox: tuple[int, int, int, int], pad: int = 30) -> bytes:
+        """Return a JPEG of the face region with some padding."""
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+        top, right, bottom, left = bbox
+        w, h = img.size
+        crop = img.crop((
+            max(0, left - pad),
+            max(0, top - pad),
+            min(w, right + pad),
+            min(h, bottom + pad),
+        ))
+        out = BytesIO()
+        crop.save(out, format="JPEG", quality=85)
+        return out.getvalue()
 
     def encode_for_training(self, image_bytes: bytes) -> np.ndarray | None:
         """Returns the encoding of the LARGEST face in the image, or None."""

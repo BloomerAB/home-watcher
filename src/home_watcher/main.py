@@ -27,6 +27,7 @@ from .decision.scorer import (
 )
 from .faces.db import FaceDB
 from .faces.recognizer import FaceRecognizer, save_training_photo
+from .faces.unknown_db import UnknownFaceDB
 from .notifier.ntfy import NtfyNotifier
 from .presence.unifi_clients import UnifiClientsLookup
 from .protect.client import ProtectClient
@@ -40,6 +41,7 @@ class AppState:
     settings: Settings
     cameras: dict[str, CameraConfig]
     face_db: FaceDB
+    unknown_db: UnknownFaceDB
     recognizer: FaceRecognizer
     protect: ProtectClient
     presence: UnifiClientsLookup
@@ -79,6 +81,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
         return
 
     faces = state.recognizer.recognize(snapshot) if "person" in sd_types else []
+    if faces:
+        _save_unknown_faces(faces, snapshot, camera_name)
     family_home = await state.presence.family_at_home()
     camera_cfg = state.cameras.get(camera_name, CameraConfig())
 
@@ -139,6 +143,39 @@ async def _send_notification(
         )
 
 
+def _save_unknown_faces(faces: list, snapshot: bytes, camera: str) -> None:
+    """Save crop + metadata for any face that's unknown or too uncertain."""
+    from datetime import UTC, datetime
+
+    from .faces.recognizer import FaceRecognizer
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    snapshot_dir = state.settings.data_dir / "unknown"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, face in enumerate(faces):
+        if face.is_known:
+            continue
+        if face.width_px < state.settings.min_face_width_px:
+            continue
+        if face.embedding is None:
+            continue
+
+        crop_bytes = FaceRecognizer.crop_face(snapshot, face.bbox)
+        crop_filename = f"{timestamp}_{camera}_{idx}_crop.jpg"
+        snap_filename = f"{timestamp}_{camera}_{idx}_snap.jpg"
+        (snapshot_dir / crop_filename).write_bytes(crop_bytes)
+        (snapshot_dir / snap_filename).write_bytes(snapshot)
+        state.unknown_db.add(
+            camera=camera,
+            crop_filename=crop_filename,
+            snapshot_filename=snap_filename,
+            bbox=face.bbox,
+            width_px=face.width_px,
+            embedding=face.embedding,
+        )
+
+
 async def _ws_loop() -> None:
     ws = ProtectWebSocket(state.protect)
     try:
@@ -165,6 +202,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("family_macs_loaded", count=len(family_macs))
 
     state.face_db = FaceDB(settings.data_dir / "faces.db")
+    state.unknown_db = UnknownFaceDB(settings.data_dir / "unknown.db")
     state.recognizer = FaceRecognizer(
         state.face_db,
         tolerance=settings.face_tolerance,
@@ -267,6 +305,175 @@ async def test_recognize(
         }
         for f in faces
     ]
+
+
+@app.get("/api/unknown")
+async def list_unknown(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 100
+) -> list[dict[str, object]]:
+    rows = s.unknown_db.list_unlabeled(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at.isoformat(),
+            "camera": r.camera,
+            "width_px": r.width_px,
+            "crop_url": f"/api/unknown/{r.id}/crop",
+            "snapshot_url": f"/api/unknown/{r.id}/snapshot",
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/unknown/{face_id}/crop")
+async def get_unknown_crop(
+    face_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.unknown_db.get(face_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown" / row.crop_filename)
+
+
+@app.get("/api/unknown/{face_id}/snapshot")
+async def get_unknown_snapshot(
+    face_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.unknown_db.get(face_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown" / row.snapshot_filename)
+
+
+@app.post("/api/unknown/{face_id}/label")
+async def label_unknown(
+    face_id: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.unknown_db.get(face_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    crop_path = s.settings.data_dir / "unknown" / row.crop_filename
+    crop_bytes = crop_path.read_bytes() if crop_path.exists() else b""
+    if crop_bytes:
+        save_training_photo(s.settings.data_dir, subject, row.crop_filename, crop_bytes)
+    db_id = s.face_db.add(subject, row.crop_filename, row.embedding)
+    s.unknown_db.mark_labeled(face_id)
+    s.recognizer.reload()
+    return {"face_db_id": db_id, "subject": subject}
+
+
+@app.delete("/api/unknown/{face_id}")
+async def discard_unknown(
+    face_id: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.unknown_db.get(face_id) is None:
+        raise HTTPException(status_code=404)
+    s.unknown_db.mark_discarded(face_id)
+    return {"status": "discarded"}
+
+
+@app.get("/", response_class=None)
+async def root():
+    from fastapi.responses import HTMLResponse
+    from pathlib import Path as P
+
+    html_path = P(__file__).parent / "static" / "index.html"
+    if html_path.exists():
+        return HTMLResponse(html_path.read_text())
+    return HTMLResponse(_INLINE_HTML)
+
+
+_INLINE_HTML = """<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<title>home-watcher — label unknown faces</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;
+         margin: 0; padding: 1rem; background: #111; color: #eee; }
+  h1 { margin-top: 0; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; }
+  .card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; }
+  .card img { width: 100%; height: auto; border-radius: 4px; display: block; }
+  .meta { font-size: 0.85rem; color: #999; margin: 0.5rem 0; }
+  .row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  input[type=text] { flex: 1; padding: 0.4rem 0.6rem; background: #2a2a2a; color: #eee;
+                     border: 1px solid #444; border-radius: 4px; }
+  button { padding: 0.4rem 0.8rem; border: none; border-radius: 4px;
+           background: #2563eb; color: white; cursor: pointer; }
+  button.secondary { background: #444; }
+  button:hover { opacity: 0.9; }
+  details { margin-top: 0.5rem; font-size: 0.85rem; }
+  details summary { cursor: pointer; color: #888; }
+  .known { font-size: 0.85rem; color: #888; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+<h1>Okända ansikten</h1>
+<div class="known" id="known"></div>
+<div class="grid" id="grid"></div>
+<script>
+  async function loadKnown() {
+    const r = await fetch('/api/subjects');
+    const data = await r.json();
+    const parts = Object.entries(data).map(([n, c]) => `${n} (${c})`);
+    document.getElementById('known').textContent =
+      parts.length ? 'Tränade: ' + parts.join(', ') : 'Inga tränade ansikten än';
+  }
+  async function loadUnknown() {
+    const r = await fetch('/api/unknown');
+    const items = await r.json();
+    const grid = document.getElementById('grid');
+    grid.innerHTML = '';
+    if (items.length === 0) {
+      grid.innerHTML = '<p>Inga okända ansikten i kön.</p>';
+      return;
+    }
+    for (const f of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${f.crop_url}" alt="face">
+        <div class="meta">${f.camera} — ${new Date(f.detected_at).toLocaleString('sv-SE')} — ${f.width_px}px</div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Malin)" id="name-${f.id}">
+          <button onclick="label(${f.id})">Spara</button>
+        </div>
+        <div class="row">
+          <button class="secondary" onclick="discard(${f.id})">Skippa</button>
+        </div>
+        <details><summary>Full bild</summary><img src="${f.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+  async function label(id) {
+    const name = document.getElementById('name-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await fetch(`/api/unknown/${id}/label`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: name}),
+    });
+    if (r.ok) { await loadKnown(); await loadUnknown(); }
+    else alert('Kunde inte spara: ' + r.status);
+  }
+  async function discard(id) {
+    const r = await fetch(`/api/unknown/${id}`, {method: 'DELETE'});
+    if (r.ok) await loadUnknown();
+  }
+  loadKnown(); loadUnknown();
+  setInterval(loadUnknown, 30000);
+</script>
+</body>
+</html>"""
 
 
 def main() -> None:
