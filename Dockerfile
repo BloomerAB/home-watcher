@@ -33,8 +33,11 @@ RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     pip install --prefix=/install .
 
 # Pre-download YOLOv8 nano model so first inference is offline-capable
+WORKDIR /build/models
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
+    YOLO_CONFIG_DIR=/tmp/Ultralytics \
     python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+WORKDIR /build
 
 # ---------- runtime ----------
 FROM python:3.13-slim
@@ -53,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd -u 1000 -m -s /bin/bash app
 
 COPY --from=builder /install /usr/local
-COPY --from=builder /root/yolov8n.pt /home/app/yolov8n.pt
+COPY --from=builder /build/models/yolov8n.pt /home/app/yolov8n.pt
 RUN chown -R 1000:1000 /home/app
 
 USER 1000
