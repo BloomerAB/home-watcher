@@ -3,14 +3,29 @@
 NTFY API: POST to https://ntfy.sh/<topic>. Headers control title/priority/etc.
 Body can be either text (message) or binary (attachment). For attachment +
 message in same notification: send body=binary, message via "Message" header.
+
+Non-ASCII header values (Swedish chars like ä, å, ö in titles) are encoded
+as RFC 2047 MIME encoded-words so they survive httpx's strict ASCII-only
+header validation and are decoded properly by NTFY clients.
 """
 
 from __future__ import annotations
+
+from email.header import Header
 
 import httpx
 import structlog
 
 log = structlog.get_logger(__name__)
+
+
+def _encode_header(value: str) -> str:
+    """Encode header value safely for non-ASCII (RFC 2047 if needed)."""
+    try:
+        value.encode("ascii")
+        return value
+    except UnicodeEncodeError:
+        return Header(value, charset="utf-8").encode()
 
 
 class NtfyNotifier:
@@ -39,17 +54,17 @@ class NtfyNotifier:
         """
         url = f"{self.base_url}/{self.topic}"
         headers = dict(self._headers)
-        headers["X-Title"] = title
+        headers["X-Title"] = _encode_header(title)
         headers["X-Priority"] = str(priority)
         if tags:
-            headers["X-Tags"] = ",".join(tags)
+            headers["X-Tags"] = _encode_header(",".join(tags))
         if click_url:
             headers["X-Click"] = click_url
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 if image_bytes:
-                    headers["X-Message"] = message
+                    headers["X-Message"] = _encode_header(message)
                     headers["X-Filename"] = "snapshot.jpg"
                     resp = await client.post(url, headers=headers, content=image_bytes)
                 else:
