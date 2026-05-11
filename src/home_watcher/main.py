@@ -69,11 +69,24 @@ def _setup_logging(level: str) -> None:
 
 
 async def _handle_event(update: ProtectUpdate) -> None:
+    # Diagnostic: log every incoming update at debug level + a sampled count at info
+    state._event_count = getattr(state, "_event_count", 0) + 1  # type: ignore[attr-defined]
+    if state._event_count % 50 == 1:  # type: ignore[attr-defined]
+        log.info(
+            "ws_event_sample",
+            count=state._event_count,  # type: ignore[attr-defined]
+            model=update.model_key,
+            action=update.action,
+            data_keys=list(update.data.keys())[:8],
+        )
+
     if not is_motion_event(update):
         return
     camera_id = update.id
     camera_name = state.protect.camera_name(camera_id)
     sd_types = smart_detect_types(update)
+    log.info("motion_event_received", camera=camera_name, types=sd_types,
+             data_keys=list(update.data.keys()))
     if not sd_types:
         return  # Pure motion without classification — ignore for now
 
