@@ -83,11 +83,14 @@ class ProtectClient:
         types: list[str] | None = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """Fetch historical events from Protect REST API."""
+        """Fetch historical events from Protect REST API.
+
+        Note: Protect's server-side `types` query param is undocumented and
+        broken (returns empty regardless of value). We fetch all events and
+        filter client-side.
+        """
         client = await self._ensure_client()
         params: dict[str, Any] = {"start": start_ms, "end": end_ms, "limit": limit}
-        if types:
-            params["types"] = ",".join(types)
         resp = await client.get(
             "/proxy/protect/api/events",
             params=params,
@@ -101,7 +104,11 @@ class ProtectClient:
                 headers=self._auth_headers(),
             )
         resp.raise_for_status()
-        return resp.json() or []
+        events: list[dict[str, Any]] = resp.json() or []
+        if types:
+            wanted = set(types)
+            events = [e for e in events if e.get("type") in wanted]
+        return events
 
     async def fetch_event_thumbnail(self, event_id: str) -> bytes | None:
         """Fetch the still JPEG thumbnail captured at the event's moment."""
