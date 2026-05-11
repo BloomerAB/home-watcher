@@ -107,30 +107,35 @@ async def _handle_event(update: ProtectUpdate) -> None:
         face_count=len(faces),
     )
 
-    await _send_notification(result, camera_name, sd_types, snapshot)
+    await _send_notification(result, camera_id, camera_name, sd_types, snapshot)
 
 
 async def _send_notification(
     result: DecisionResult,
+    camera_id: str,
     camera_name: str,
     sd_types: list[str],
     snapshot: bytes,
 ) -> None:
+    click_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
+
     if result.decision == Decision.ALERT:
         await state.notifier.send(
-            title=f"⚠️ Okänd rörelse vid {camera_name}",
+            title=f"Okänd rörelse vid {camera_name}",
             message=f"Score: {result.score:.2f}\n" + "\n".join(result.reasons),
             priority=4,
             tags=["warning", "house"],
             image_bytes=snapshot,
+            click_url=click_url,
         )
     elif result.decision == Decision.NOTIFY_ANIMAL:
         await state.notifier.send(
-            title=f"🐾 Djur vid {camera_name}",
+            title=f"Djur vid {camera_name}",
             message="Smart detection: " + ", ".join(sd_types),
             priority=2,
             tags=["paw_prints"],
             image_bytes=snapshot,
+            click_url=click_url,
         )
 
 

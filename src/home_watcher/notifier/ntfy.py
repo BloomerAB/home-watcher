@@ -1,4 +1,11 @@
-"""NTFY push notification client."""
+"""NTFY push notification client.
+
+NTFY API: POST to https://ntfy.sh/<topic>. Headers control title/priority/etc.
+Body can be either text (message) or binary (attachment). For attachment +
+message in same notification: send body=binary, message via "Message" header.
+"""
+
+from __future__ import annotations
 
 import httpx
 import structlog
@@ -22,25 +29,29 @@ class NtfyNotifier:
         priority: int = 3,
         tags: list[str] | None = None,
         image_bytes: bytes | None = None,
+        click_url: str | None = None,
     ) -> bool:
+        """Send a single NTFY notification with optional image attachment.
+
+        When `image_bytes` is provided, the body is the image and `message` is
+        carried in the X-Message header (NTFY renders this as the notification
+        text while showing the image inline).
+        """
         url = f"{self.base_url}/{self.topic}"
         headers = dict(self._headers)
-        headers["Title"] = title
-        headers["Priority"] = str(priority)
+        headers["X-Title"] = title
+        headers["X-Priority"] = str(priority)
         if tags:
-            headers["Tags"] = ",".join(tags)
+            headers["X-Tags"] = ",".join(tags)
+        if click_url:
+            headers["X-Click"] = click_url
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 if image_bytes:
-                    headers["Filename"] = "snapshot.jpg"
-                    resp = await client.put(
-                        url, headers=headers, content=image_bytes
-                    )
-                    if resp.is_success:
-                        await client.post(
-                            url, headers=self._headers, content=message.encode("utf-8")
-                        )
+                    headers["X-Message"] = message
+                    headers["X-Filename"] = "snapshot.jpg"
+                    resp = await client.post(url, headers=headers, content=image_bytes)
                 else:
                     resp = await client.post(
                         url, headers=headers, content=message.encode("utf-8")
