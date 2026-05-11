@@ -51,6 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libgl1 \
     libglib2.0-0 \
+    libpng16-16 \
+    libjpeg62-turbo \
+    libfreetype6 \
+    libwebp7 \
+    libtiff6 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -m -s /bin/bash app
