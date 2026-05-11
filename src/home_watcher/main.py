@@ -92,17 +92,26 @@ async def _handle_event(update: ProtectUpdate) -> None:
     sd_types = smart_detect_types(update)
     log.info("motion_event_received", camera=camera_name, types=sd_types,
              data_keys=list(update.data.keys()))
-    if not sd_types:
-        return  # Pure motion without classification — ignore for now
-
-    log.info("motion_event", camera=camera_name, types=sd_types)
 
     snapshot = await state.protect.fetch_snapshot(camera_id)
     if snapshot is None:
         log.warning("snapshot_unavailable", camera=camera_name)
         return
 
-    faces = state.recognizer.recognize(snapshot) if "person" in sd_types else []
+    # ALWAYS run face recognition on the snapshot — don't rely on Protect having
+    # configured 'person' smart detection on this camera. If we find any face,
+    # treat as a person event regardless of what Protect classified.
+    faces = state.recognizer.recognize(snapshot)
+    if faces and "person" not in sd_types:
+        sd_types = [*sd_types, "person"]
+        log.info("inferred_person_from_face", camera=camera_name,
+                 face_count=len(faces))
+
+    if not sd_types:
+        log.info("motion_no_useful_classification", camera=camera_name)
+        return
+
+    log.info("motion_event", camera=camera_name, types=sd_types)
     if faces:
         _save_unknown_faces(faces, snapshot, camera_name)
     if "animal" in sd_types:
