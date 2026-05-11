@@ -28,6 +28,8 @@ from .decision.scorer import (
 from .faces.db import FaceDB
 from .faces.recognizer import FaceRecognizer, save_training_photo
 from .faces.unknown_db import UnknownFaceDB
+from .pets.db import PetDB
+from .pets.detector import PetDetector
 from .notifier.ntfy import NtfyNotifier
 from .presence.unifi_clients import UnifiClientsLookup
 from .protect.client import ProtectClient
@@ -43,6 +45,8 @@ class AppState:
     face_db: FaceDB
     unknown_db: UnknownFaceDB
     recognizer: FaceRecognizer
+    pet_db: PetDB
+    pet_detector: PetDetector
     protect: ProtectClient
     presence: UnifiClientsLookup
     notifier: NtfyNotifier
@@ -83,6 +87,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
     faces = state.recognizer.recognize(snapshot) if "person" in sd_types else []
     if faces:
         _save_unknown_faces(faces, snapshot, camera_name)
+    if "animal" in sd_types:
+        _detect_and_save_pets(snapshot, camera_name)
     family_home = await state.presence.family_at_home()
     camera_cfg = state.cameras.get(camera_name, CameraConfig())
 
@@ -141,6 +147,43 @@ async def _send_notification(
             image_bytes=snapshot,
             click_url=click_url,
         )
+
+
+def _detect_and_save_pets(snapshot: bytes, camera: str) -> None:
+    """Run YOLO on snapshot, save any animal detections to the unknown_pets queue."""
+    from datetime import UTC, datetime
+
+    try:
+        pets = state.pet_detector.detect(snapshot)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pet_detect_failed", error=str(exc), camera=camera)
+        return
+    if not pets:
+        log.info("pet_event_no_yolo_match", camera=camera)
+        return
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    pet_dir = state.settings.data_dir / "unknown_pets"
+    pet_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, pet in enumerate(pets):
+        crop_bytes = PetDetector.crop(snapshot, pet.bbox)
+        crop_filename = f"{timestamp}_{camera}_{pet.species}_{idx}_crop.jpg"
+        snap_filename = f"{timestamp}_{camera}_{pet.species}_{idx}_snap.jpg"
+        (pet_dir / crop_filename).write_bytes(crop_bytes)
+        (pet_dir / snap_filename).write_bytes(snapshot)
+        state.pet_db.add_unknown(
+            camera=camera,
+            species=pet.species,
+            confidence=pet.confidence,
+            crop_filename=crop_filename,
+            snapshot_filename=snap_filename,
+            bbox=pet.bbox,
+            width_px=pet.width_px,
+            height_px=pet.height_px,
+        )
+        log.info("pet_detected", camera=camera, species=pet.species,
+                 confidence=round(pet.confidence, 2))
 
 
 def _save_unknown_faces(faces: list, snapshot: bytes, camera: str) -> None:
@@ -208,6 +251,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tolerance=settings.face_tolerance,
         min_face_width_px=settings.min_face_width_px,
     )
+    state.pet_db = PetDB(settings.data_dir / "pets.db")
+    state.pet_detector = PetDetector()
     state.protect = ProtectClient(
         host=settings.unifi_host,
         username=settings.unifi_user,
@@ -381,6 +426,89 @@ async def discard_unknown(
     return {"status": "discarded"}
 
 
+@app.get("/api/pets/subjects")
+async def list_pet_subjects(s: Annotated[AppState, Depends(_get_state)]) -> dict[str, int]:
+    return s.pet_db.list_known_subjects()
+
+
+@app.get("/api/pets/unknown")
+async def list_unknown_pets(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 100
+) -> list[dict[str, object]]:
+    rows = s.pet_db.list_unlabeled(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at.isoformat(),
+            "camera": r.camera,
+            "species": r.species,
+            "confidence": round(r.confidence, 2),
+            "width_px": r.width_px,
+            "height_px": r.height_px,
+            "crop_url": f"/api/pets/unknown/{r.id}/crop",
+            "snapshot_url": f"/api/pets/unknown/{r.id}/snapshot",
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/pets/unknown/{pet_id}/crop")
+async def get_unknown_pet_crop(
+    pet_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.pet_db.get_unknown(pet_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_pets" / row.crop_filename)
+
+
+@app.get("/api/pets/unknown/{pet_id}/snapshot")
+async def get_unknown_pet_snapshot(
+    pet_id: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.pet_db.get_unknown(pet_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_pets" / row.snapshot_filename)
+
+
+@app.post("/api/pets/unknown/{pet_id}/label")
+async def label_unknown_pet(
+    pet_id: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.pet_db.get_unknown(pet_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    # Move/copy the crop into the known pets dir
+    crop_src = s.settings.data_dir / "unknown_pets" / row.crop_filename
+    known_dir = s.settings.data_dir / "pets" / subject
+    known_dir.mkdir(parents=True, exist_ok=True)
+    if crop_src.exists():
+        (known_dir / row.crop_filename).write_bytes(crop_src.read_bytes())
+    db_id = s.pet_db.add_known(subject, row.species, row.crop_filename)
+    s.pet_db.mark_labeled(pet_id)
+    return {"known_id": db_id, "subject": subject, "species": row.species}
+
+
+@app.delete("/api/pets/unknown/{pet_id}")
+async def discard_unknown_pet(
+    pet_id: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.pet_db.get_unknown(pet_id) is None:
+        raise HTTPException(status_code=404)
+    s.pet_db.mark_discarded(pet_id)
+    return {"status": "discarded"}
+
+
 @app.get("/", response_class=None)
 async def root():
     from fastapi.responses import HTMLResponse
@@ -396,11 +524,12 @@ _INLINE_HTML = """<!doctype html>
 <html lang="sv">
 <head>
 <meta charset="utf-8">
-<title>home-watcher — label unknown faces</title>
+<title>home-watcher — labeling</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;
          margin: 0; padding: 1rem; background: #111; color: #eee; }
-  h1 { margin-top: 0; }
+  h1, h2 { margin-top: 0; }
+  h2 { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #333; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; }
   .card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; }
   .card img { width: 100%; height: auto; border-radius: 4px; display: block; }
@@ -415,29 +544,33 @@ _INLINE_HTML = """<!doctype html>
   details { margin-top: 0.5rem; font-size: 0.85rem; }
   details summary { cursor: pointer; color: #888; }
   .known { font-size: 0.85rem; color: #888; margin-bottom: 1rem; }
+  .tag { display: inline-block; background: #333; color: #ccc; padding: 0.1rem 0.4rem;
+         border-radius: 3px; font-size: 0.75rem; margin-right: 0.25rem; }
 </style>
 </head>
 <body>
+
 <h1>Okända ansikten</h1>
-<div class="known" id="known"></div>
-<div class="grid" id="grid"></div>
+<div class="known" id="known-faces"></div>
+<div class="grid" id="grid-faces"></div>
+
+<h2>Okända djur</h2>
+<div class="known" id="known-pets"></div>
+<div class="grid" id="grid-pets"></div>
+
 <script>
-  async function loadKnown() {
-    const r = await fetch('/api/subjects');
+  async function loadKnown(url, target, prefix) {
+    const r = await fetch(url);
     const data = await r.json();
     const parts = Object.entries(data).map(([n, c]) => `${n} (${c})`);
-    document.getElementById('known').textContent =
-      parts.length ? 'Tränade: ' + parts.join(', ') : 'Inga tränade ansikten än';
+    target.textContent = parts.length ? prefix + ': ' + parts.join(', ') : 'Inga tränade än';
   }
-  async function loadUnknown() {
+
+  async function loadFaces() {
     const r = await fetch('/api/unknown');
     const items = await r.json();
-    const grid = document.getElementById('grid');
-    grid.innerHTML = '';
-    if (items.length === 0) {
-      grid.innerHTML = '<p>Inga okända ansikten i kön.</p>';
-      return;
-    }
+    const grid = document.getElementById('grid-faces');
+    grid.innerHTML = items.length === 0 ? '<p>Inga okända ansikten i kön.</p>' : '';
     for (const f of items) {
       const card = document.createElement('div');
       card.className = 'card';
@@ -445,32 +578,79 @@ _INLINE_HTML = """<!doctype html>
         <img src="${f.crop_url}" alt="face">
         <div class="meta">${f.camera} — ${new Date(f.detected_at).toLocaleString('sv-SE')} — ${f.width_px}px</div>
         <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malin)" id="name-${f.id}">
-          <button onclick="label(${f.id})">Spara</button>
+          <input type="text" placeholder="Namn (t.ex. Malin)" id="fn-${f.id}">
+          <button onclick="labelFace(${f.id})">Spara</button>
         </div>
-        <div class="row">
-          <button class="secondary" onclick="discard(${f.id})">Skippa</button>
-        </div>
+        <div class="row"><button class="secondary" onclick="discardFace(${f.id})">Skippa</button></div>
         <details><summary>Full bild</summary><img src="${f.snapshot_url}" style="margin-top:0.5rem"></details>`;
       grid.appendChild(card);
     }
   }
-  async function label(id) {
-    const name = document.getElementById('name-' + id).value.trim();
-    if (!name) { alert('Ange namn'); return; }
-    const r = await fetch(`/api/unknown/${id}/label`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+
+  async function loadPets() {
+    const r = await fetch('/api/pets/unknown');
+    const items = await r.json();
+    const grid = document.getElementById('grid-pets');
+    grid.innerHTML = items.length === 0 ? '<p>Inga okända djur i kön.</p>' : '';
+    for (const p of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${p.crop_url}" alt="pet">
+        <div class="meta">
+          <span class="tag">${p.species}</span>
+          <span class="tag">${Math.round(p.confidence*100)}%</span>
+          ${p.camera} — ${new Date(p.detected_at).toLocaleString('sv-SE')}
+        </div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Bella)" id="pn-${p.id}">
+          <button onclick="labelPet(${p.id})">Spara</button>
+        </div>
+        <div class="row"><button class="secondary" onclick="discardPet(${p.id})">Skippa</button></div>
+        <details><summary>Full bild</summary><img src="${p.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+
+  async function postLabel(url, id, name) {
+    return fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({subject: name}),
     });
-    if (r.ok) { await loadKnown(); await loadUnknown(); }
-    else alert('Kunde inte spara: ' + r.status);
   }
-  async function discard(id) {
-    const r = await fetch(`/api/unknown/${id}`, {method: 'DELETE'});
-    if (r.ok) await loadUnknown();
+
+  async function labelFace(id) {
+    const name = document.getElementById('fn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
-  loadKnown(); loadUnknown();
-  setInterval(loadUnknown, 30000);
+  async function labelPet(id) {
+    const name = document.getElementById('pn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/pets/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
+  }
+  async function discardFace(id) {
+    await fetch(`/api/unknown/${id}`, {method: 'DELETE'});
+    await loadFaces();
+  }
+  async function discardPet(id) {
+    await fetch(`/api/pets/unknown/${id}`, {method: 'DELETE'});
+    await loadPets();
+  }
+
+  async function refresh() {
+    await Promise.all([
+      loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
+      loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
+      loadFaces(),
+      loadPets(),
+    ]);
+  }
+  refresh();
+  setInterval(refresh, 30000);
 </script>
 </body>
 </html>"""

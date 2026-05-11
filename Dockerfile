@@ -21,23 +21,40 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
 
-RUN pip install --upgrade pip wheel \
-    && pip install --prefix=/install .
+RUN pip install --upgrade pip wheel
+
+# Install CPU-only torch first so ultralytics doesn't pull CUDA wheels (~2GB heavier)
+RUN pip install --prefix=/install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch torchvision
+
+# Now install the rest (ultralytics will reuse the torch we just installed)
+RUN PYTHONPATH=/install/lib/python3.13/site-packages \
+    pip install --prefix=/install .
+
+# Pre-download YOLOv8 nano model so first inference is offline-capable
+RUN PYTHONPATH=/install/lib/python3.13/site-packages \
+    python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
 # ---------- runtime ----------
 FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    YOLO_CONFIG_DIR=/home/app/.config/Ultralytics
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas0 \
     libgomp1 \
+    libgl1 \
+    libglib2.0-0 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -u 1000 -m -s /bin/bash app
 
 COPY --from=builder /install /usr/local
+COPY --from=builder /root/yolov8n.pt /home/app/yolov8n.pt
+RUN chown -R 1000:1000 /home/app
 
 USER 1000
 WORKDIR /home/app
