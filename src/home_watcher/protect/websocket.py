@@ -78,12 +78,29 @@ class ProtectWebSocket:
             ping_timeout=10,
         ) as ws:
             log.info("ws_connected")
+            msg_count = 0
+            decode_fail = 0
             async for raw in self._iter_messages(ws):
+                msg_count += 1
+                if msg_count <= 5 or msg_count % 50 == 0:
+                    log.info(
+                        "ws_raw_msg",
+                        count=msg_count,
+                        kind=type(raw).__name__,
+                        size=len(raw) if hasattr(raw, "__len__") else None,
+                        first_bytes=(raw[:16].hex() if isinstance(raw, bytes) else str(raw)[:60]),
+                        decode_fails=decode_fail,
+                    )
                 if not isinstance(raw, bytes):
                     continue
                 update = decode(raw)
-                if update is not None:
-                    yield update
+                if update is None:
+                    decode_fail += 1
+                    if decode_fail <= 3:
+                        log.warning("ws_decode_failed", size=len(raw),
+                                    head=raw[:32].hex())
+                    continue
+                yield update
 
     async def _iter_messages(self, ws: ClientConnection) -> AsyncIterator[bytes | str]:
         stopper = asyncio.create_task(self._stop.wait())
