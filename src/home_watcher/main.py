@@ -564,6 +564,102 @@ async def discard_unknown_pet(
     return {"status": "discarded"}
 
 
+@app.post("/api/backfill")
+async def backfill_old_events(
+    s: Annotated[AppState, Depends(_get_state)],
+    days: int = 7,
+    max_events: int = 500,
+) -> dict[str, int]:
+    """Pull historical events from Protect for the last `days` days,
+    run face detection on each event thumbnail, queue unknown faces
+    for labeling in the UI.
+
+    Useful right after setup to build training data from existing footage.
+    """
+    import time as _time
+    from datetime import UTC, datetime
+
+    now_ms = int(_time.time() * 1000)
+    start_ms = now_ms - days * 24 * 3600 * 1000
+
+    events = await s.protect.list_events(
+        start_ms, now_ms,
+        types=["motion", "smartDetectZone"],
+        limit=max_events,
+    )
+    log.info("backfill_started", days=days, event_count=len(events))
+
+    faces_found = 0
+    events_with_thumbnail = 0
+    events_with_no_face = 0
+    events_with_known_face = 0
+
+    snapshot_dir = s.settings.data_dir / "unknown"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    for ev in events:
+        event_id = ev.get("id")
+        camera_id = ev.get("camera")
+        if not event_id or not camera_id:
+            continue
+        camera_name = s.protect.camera_name(camera_id)
+        thumb = await s.protect.fetch_event_thumbnail(event_id)
+        if thumb is None:
+            continue
+        events_with_thumbnail += 1
+
+        try:
+            detected = s.recognizer.recognize(thumb)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("backfill_face_recog_failed", event_id=event_id, error=str(exc))
+            continue
+
+        if not detected:
+            events_with_no_face += 1
+            continue
+
+        for idx, face in enumerate(detected):
+            if face.is_known:
+                events_with_known_face += 1
+                continue
+            if face.width_px < s.settings.min_face_width_px:
+                continue
+            if face.embedding is None:
+                continue
+
+            crop_bytes = type(s.recognizer).crop_face(thumb, face.bbox)
+            ts = datetime.fromtimestamp(ev.get("start", now_ms) / 1000, UTC).strftime("%Y%m%dT%H%M%S")
+            crop_filename = f"backfill_{ts}_{camera_name}_{event_id[:8]}_{idx}_crop.jpg"
+            snap_filename = f"backfill_{ts}_{camera_name}_{event_id[:8]}_{idx}_snap.jpg"
+            (snapshot_dir / crop_filename).write_bytes(crop_bytes)
+            (snapshot_dir / snap_filename).write_bytes(thumb)
+            s.unknown_db.add(
+                camera=camera_name,
+                crop_filename=crop_filename,
+                snapshot_filename=snap_filename,
+                bbox=face.bbox,
+                width_px=face.width_px,
+                embedding=face.embedding,
+            )
+            faces_found += 1
+
+    log.info(
+        "backfill_done",
+        events_total=len(events),
+        events_with_thumbnail=events_with_thumbnail,
+        events_no_face=events_with_no_face,
+        events_known_face=events_with_known_face,
+        new_unknown_faces=faces_found,
+    )
+    return {
+        "events_total": len(events),
+        "events_with_thumbnail": events_with_thumbnail,
+        "events_no_face": events_with_no_face,
+        "events_known_face": events_with_known_face,
+        "new_unknown_faces": faces_found,
+    }
+
+
 @app.get("/", response_class=None)
 async def root():
     from fastapi.responses import HTMLResponse

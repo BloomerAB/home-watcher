@@ -75,6 +75,58 @@ class ProtectClient:
             return camera_id
         return str(cam.get("name", camera_id))
 
+    async def list_events(
+        self,
+        start_ms: int,
+        end_ms: int,
+        *,
+        types: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical events from Protect REST API."""
+        client = await self._ensure_client()
+        params: dict[str, Any] = {"start": start_ms, "end": end_ms, "limit": limit}
+        if types:
+            params["types"] = ",".join(types)
+        resp = await client.get(
+            "/proxy/protect/api/events",
+            params=params,
+            headers=self._auth_headers(),
+        )
+        if resp.status_code in (401, 403):
+            await self.login()
+            resp = await client.get(
+                "/proxy/protect/api/events",
+                params=params,
+                headers=self._auth_headers(),
+            )
+        resp.raise_for_status()
+        return resp.json() or []
+
+    async def fetch_event_thumbnail(self, event_id: str) -> bytes | None:
+        """Fetch the still JPEG thumbnail captured at the event's moment."""
+        client = await self._ensure_client()
+        try:
+            resp = await client.get(
+                f"/proxy/protect/api/events/{event_id}/thumbnail",
+                headers=self._auth_headers(),
+                timeout=15.0,
+            )
+            if resp.status_code in (401, 403):
+                await self.login()
+                resp = await client.get(
+                    f"/proxy/protect/api/events/{event_id}/thumbnail",
+                    headers=self._auth_headers(),
+                    timeout=15.0,
+                )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.content
+        except httpx.HTTPError as exc:
+            log.warning("event_thumbnail_failed", event_id=event_id, error=str(exc))
+            return None
+
     async def fetch_snapshot(self, camera_id: str, width: int = 1920) -> bytes | None:
         client = await self._ensure_client()
         try:
