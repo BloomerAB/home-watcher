@@ -105,20 +105,48 @@ def _decode_payload(buf: bytes, *, format_flag: int, compressed: int) -> bytes:
 
 
 def is_motion_event(update: ProtectUpdate) -> bool:
-    """True if this is a camera update indicating motion or smart detect."""
-    if update.model_key != "camera" or update.action != "update":
-        return False
-    return any(key in update.data for key in ("lastMotion", "lastSmartDetect", "isMotionDetected"))
+    """True if this update represents a new motion or smart-detection event.
+
+    UniFi Protect signals events via two paths:
+      1. `model=event, action=add` — a new Event object created. Contains
+         type, smartDetectTypes, camera reference, start timestamp, etc.
+      2. `model=camera, action=update` — camera state delta with
+         lastMotion or lastSmartDetect updated.
+
+    We treat (1) as the canonical source since it carries the full payload.
+    (2) is useful as a fallback or for cameras that only do basic motion
+    without smart-detect classification.
+    """
+    if update.model_key == "event" and update.action == "add":
+        ev_type = update.data.get("type")
+        return ev_type in ("motion", "smartDetectZone", "smartDetectLine")
+    if update.model_key == "camera" and update.action == "update":
+        return any(
+            key in update.data for key in ("lastMotion", "lastSmartDetect", "isMotionDetected")
+        )
+    return False
 
 
 def smart_detect_types(update: ProtectUpdate) -> list[str]:
     """Extract list of smart detect types (e.g. ['person'], ['vehicle'])."""
+    # event-add payload: direct smartDetectTypes field
+    raw = update.data.get("smartDetectTypes")
+    if isinstance(raw, list):
+        return [str(t) for t in raw]
+    # camera-update payload: nested under lastSmartDetect
     last_sd = update.data.get("lastSmartDetect")
     if isinstance(last_sd, dict):
         types = last_sd.get("smartDetectTypes")
         if isinstance(types, list):
             return [str(t) for t in types]
-    raw = update.data.get("smartDetectTypes")
-    if isinstance(raw, list):
-        return [str(t) for t in raw]
     return []
+
+
+def event_camera_id(update: ProtectUpdate) -> str | None:
+    """Extract camera ID from either event-add or camera-update payload."""
+    if update.model_key == "event":
+        cam = update.data.get("camera")
+        return str(cam) if cam else None
+    if update.model_key == "camera":
+        return update.id  # camera's own id is the update id
+    return None
