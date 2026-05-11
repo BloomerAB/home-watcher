@@ -45,8 +45,24 @@ def load_cameras(path: Path) -> dict[str, CameraConfig]:
 
 
 def load_family_macs(path: Path) -> dict[str, str]:
-    """Return mapping of MAC -> family member name."""
+    """Return mapping of MAC -> family member name.
+
+    YAML schema accepts either a single MAC string or a list per person:
+        members:
+          Malin: "aa:bb:..."
+          Loe:
+            - "11:22:..."
+            - "33:44:..."   # alt MAC after randomization rotation
+    """
     if not path.exists():
         return {}
     raw = yaml.safe_load(path.read_text())
-    return {mac.lower(): name for name, mac in raw.get("members", {}).items()}
+    out: dict[str, str] = {}
+    for name, value in (raw.get("members") or {}).items():
+        if isinstance(value, str):
+            out[value.lower()] = name
+        elif isinstance(value, list):
+            for mac in value:
+                if isinstance(mac, str):
+                    out[mac.lower()] = name
+    return out
