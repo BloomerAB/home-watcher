@@ -107,6 +107,19 @@ async def _handle_event(update: ProtectUpdate) -> None:
         log.info("inferred_person_from_face", camera=camera_name,
                  face_count=len(faces))
 
+    # If still no person classification, fall back to YOLO person detection.
+    # Outdoor face_recognition often misses faces at distance/angle, but YOLO
+    # can detect persons reliably from body shape.
+    if "person" not in sd_types and "animal" not in sd_types:
+        try:
+            person_count = state.pet_detector.detect_persons(snapshot)
+            if person_count > 0:
+                sd_types = [*sd_types, "person"]
+                log.info("inferred_person_from_yolo", camera=camera_name,
+                         person_count=person_count)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("yolo_person_detect_failed", error=str(exc))
+
     if not sd_types:
         log.info("motion_no_useful_classification", camera=camera_name)
         return
