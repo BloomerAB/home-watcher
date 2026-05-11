@@ -20,12 +20,21 @@ log = structlog.get_logger(__name__)
 
 
 def _encode_header(value: str) -> str:
-    """Encode header value safely for non-ASCII (RFC 2047 if needed)."""
+    """Encode header value safely for non-ASCII (RFC 2047 if needed).
+
+    Header.encode() folds long values with CRLF + space, but HTTP headers
+    can't contain newlines mid-value. We pass maxlinelen=10000 to disable
+    folding so the entire encoded value stays on one line.
+
+    Also strips any newlines from the input (e.g. multi-line messages we'd
+    rather put in the body than a header).
+    """
+    flat = value.replace("\n", " ").replace("\r", " ")
     try:
-        value.encode("ascii")
-        return value
+        flat.encode("ascii")
+        return flat
     except UnicodeEncodeError:
-        return Header(value, charset="utf-8").encode()
+        return Header(flat, charset="utf-8").encode(maxlinelen=10000)
 
 
 class NtfyNotifier:
