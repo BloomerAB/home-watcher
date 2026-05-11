@@ -38,11 +38,10 @@ RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     YOLO_CONFIG_DIR=/tmp/Ultralytics \
     python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
-# Pre-download OSNet x0_25 (TorchReID) weights so first body Re-ID inference
-# doesn't need to fetch from network
+# Pre-download ResNet18 pretrained weights (for Body Re-ID feature extraction)
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
-    python -c "import torchreid; torchreid.models.build_model('osnet_x0_25', num_classes=1000, pretrained=True)" \
-    || echo "torchreid pretrained download may have failed; will retry at runtime"
+    TORCH_HOME=/build/.torch \
+    python -c "import torchvision.models as m; m.resnet18(weights=m.ResNet18_Weights.IMAGENET1K_V1)"
 WORKDIR /build
 
 # ---------- runtime ----------
@@ -68,6 +67,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /install /usr/local
 COPY --from=builder /build/models/yolov8n.pt /home/app/yolov8n.pt
+COPY --from=builder /build/.torch /home/app/.torch
+ENV TORCH_HOME=/home/app/.torch
 RUN chown -R 1000:1000 /home/app
 
 USER 1000
