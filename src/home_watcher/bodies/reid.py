@@ -39,8 +39,7 @@ class BodyMatch:
 
 
 class BodyReID:
-    def __init__(self, similarity_threshold: float = 0.85) -> None:
-        # 0.85 is conservative for ResNet18-baseline. Will tune from real data.
+    def __init__(self, similarity_threshold: float = 0.65) -> None:
         self.threshold = similarity_threshold
         self._model = None
         self._torch = None

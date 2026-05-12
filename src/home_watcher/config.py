@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     face_tolerance: float = 0.6
     min_face_width_px: int = 60
     alert_score_threshold: float = 0.6
+    body_similarity_threshold: float = 0.65
 
     log_level: str = "INFO"
     bind_host: str = "0.0.0.0"

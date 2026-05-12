@@ -57,7 +57,11 @@ class AppState:
     ws_task: asyncio.Task[None] | None = None
     # Dedup state: camera_id -> last_notification_unixtime
     last_alerted: dict[str, float] = {}
-    dedup_window_seconds: float = 30.0
+    dedup_window_seconds: float = 120.0
+    # Body crop dedup: camera_id -> last body-save unixtime
+    last_body_saved: dict[str, float] = {}
+    body_save_interval_seconds: float = 10.0
+    min_body_crop_px: int = 40
 
 
 state = AppState()
@@ -139,7 +143,7 @@ async def _handle_event(update: ProtectUpdate) -> None:
     # Body Re-ID: crop each person bbox, extract embedding, match against known.
     # Save unknown bodies to queue for labeling.
     if person_bboxes:
-        body_matches = _identify_bodies(person_bboxes, snapshot, camera_name)
+        body_matches = _identify_bodies(person_bboxes, snapshot, camera_name, camera_id)
     if "animal" in sd_types:
         _detect_and_save_pets(snapshot, camera_name)
     family_home = await state.presence.family_at_home()
@@ -220,9 +224,11 @@ def _identify_bodies(
     person_bboxes: list[tuple[tuple[int, int, int, int], float]],
     snapshot: bytes,
     camera: str,
+    camera_id: str,
 ) -> list[str]:
     """Run Body Re-ID on each detected person. Return list of matched subjects.
     Save unknown bodies to queue for labeling."""
+    import time as _time
     from datetime import UTC, datetime
 
     matches: list[str] = []
@@ -231,6 +237,14 @@ def _identify_bodies(
     body_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, (bbox, conf) in enumerate(person_bboxes):
+        top, right, bottom, left = bbox
+        width = right - left
+        height = bottom - top
+
+        if width < state.min_body_crop_px or height < state.min_body_crop_px:
+            log.debug("body_crop_too_small", camera=camera, w=width, h=height)
+            continue
+
         try:
             crop_bytes = PetDetector.crop(snapshot, bbox, pad=10)
             embedding = state.body_reid.embed(crop_bytes)
@@ -239,9 +253,6 @@ def _identify_bodies(
             continue
 
         result = state.body_reid.match(embedding)
-        top, right, bottom, left = bbox
-        width = right - left
-        height = bottom - top
 
         if result.is_known:
             log.info(
@@ -253,6 +264,19 @@ def _identify_bodies(
             assert result.matched_subject is not None
             matches.append(result.matched_subject)
             continue
+
+        log.info(
+            "body_unmatched",
+            camera=camera,
+            best_similarity=round(result.similarity, 3),
+            crop_size=f"{width}x{height}",
+        )
+
+        now_ts = _time.time()
+        last_saved = state.last_body_saved.get(camera_id, 0.0)
+        if now_ts - last_saved < state.body_save_interval_seconds:
+            continue
+        state.last_body_saved[camera_id] = now_ts
 
         crop_filename = f"{timestamp}_{camera}_body_{idx}_crop.jpg"
         snap_filename = f"{timestamp}_{camera}_body_{idx}_snap.jpg"
@@ -380,7 +404,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.pet_db = PetDB(settings.data_dir / "pets.db")
     state.pet_detector = PetDetector()
     state.body_db = BodyDB(settings.data_dir / "bodies.db")
-    state.body_reid = BodyReID()
+    state.body_reid = BodyReID(similarity_threshold=settings.body_similarity_threshold)
     state.body_reid.reload(state.body_db.all_known_by_subject())
     state.protect = ProtectClient(
         host=settings.unifi_host,
