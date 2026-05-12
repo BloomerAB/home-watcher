@@ -71,6 +71,9 @@ class PetDB:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(known_pets)").fetchall()}
+            if "embedding" not in cols:
+                conn.execute("ALTER TABLE known_pets ADD COLUMN embedding BLOB")
 
     # --- unknown pets ---
 
