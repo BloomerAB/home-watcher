@@ -27,9 +27,12 @@ from .decision.scorer import (
 )
 from .bodies.db import BodyDB
 from .bodies.reid import BodyReID
+from .skeleton.analyzer import SkeletonAnalyzer
+from .skeleton.db import SkeletonDB
+from .skeleton.matcher import SkeletonMatcher
 from .trajectory.db import TrajectoryDB
 from .trajectory.matcher import TrajectoryMatcher
-from .trajectory.tracker import BurstTracker
+from .trajectory.tracker import BurstTracker, Trajectory
 from .faces.db import FaceDB
 from .faces.recognizer import FaceRecognizer, save_training_photo
 from .faces.unknown_db import UnknownFaceDB
@@ -56,6 +59,9 @@ class AppState:
     body_reid: BodyReID
     trajectory_db: TrajectoryDB
     trajectory_matcher: TrajectoryMatcher
+    skeleton_analyzer: SkeletonAnalyzer
+    skeleton_db: SkeletonDB
+    skeleton_matcher: SkeletonMatcher
     protect: ProtectClient
     presence: UnifiClientsLookup
     notifier: NtfyNotifier
@@ -154,9 +160,13 @@ async def _handle_event(update: ProtectUpdate) -> None:
     # Trajectory tracking: burst-capture 2 more snapshots and track positions.
     import time as _time
     trajectory_matches: list[str] = []
+    unmatched_trajectories: list[Trajectory] = []
+    skeleton_matches: list[str] = []
     if person_bboxes and "person" in sd_types:
-        trajectory_matches = await _track_trajectory(
-            camera_id, camera_name, person_bboxes, _time.time(),
+        trajectory_matches, unmatched_trajectories, skeleton_matches = (
+            await _track_and_analyze(
+                camera_id, camera_name, person_bboxes, snapshot, _time.time(),
+            )
         )
     family_members = await state.presence.family_members_at_home()
     family_home = len(family_members) > 0
@@ -174,6 +184,7 @@ async def _handle_event(update: ProtectUpdate) -> None:
         body_person_count=len(person_bboxes),
         family_members_home=family_members,
         trajectory_matches=trajectory_matches,
+        skeleton_matches=skeleton_matches,
     )
     result = decide(
         ctx,
@@ -190,6 +201,21 @@ async def _handle_event(update: ProtectUpdate) -> None:
         family_home=family_home,
         face_count=len(faces),
     )
+
+    # Auto-label: when decision is KNOWN_FAMILY via presence-count, save
+    # unmatched trajectories and skeleton profiles as known — training data
+    # builds up automatically without manual labeling.
+    if result.decision == Decision.KNOWN_FAMILY and family_members:
+        subject = family_members[0]
+        for traj in unmatched_trajectories:
+            state.trajectory_db.add(traj, subject=subject)
+        state.trajectory_matcher.reload(state.trajectory_db.known_by_camera())
+        log.info(
+            "auto_labeled",
+            camera=camera_name,
+            subject=subject,
+            trajectories=len(unmatched_trajectories),
+        )
 
     # Dedup: Protect emits two WS messages per motion (event/add + camera/update)
     # which both translate to the same user-visible alert. Skip if we already
@@ -319,32 +345,37 @@ def _identify_bodies(
     return matches
 
 
-async def _track_trajectory(
+async def _track_and_analyze(
     camera_id: str,
     camera_name: str,
     initial_bboxes: list[tuple[tuple[int, int, int, int], float]],
+    initial_snapshot: bytes,
     t0: float,
-) -> list[str]:
-    """Take 2 more snapshots with ~2s delay, track person movement, match trajectory."""
+) -> tuple[list[str], list[Trajectory], list[str]]:
+    """Burst-capture snapshots for trajectory tracking + skeleton analysis.
+
+    Returns (trajectory_matches, unmatched_trajectories, skeleton_matches).
+    """
     tracker = BurstTracker(camera=camera_name)
     tracker.add_frame(initial_bboxes, t0)
+    burst_snapshots = [initial_snapshot]
 
     for i in range(1, 3):
         await asyncio.sleep(2.0)
         snap = await state.protect.fetch_snapshot(camera_id)
         if snap is None:
             continue
+        burst_snapshots.append(snap)
         try:
             bboxes = state.pet_detector.detect_person_bboxes(snap)
         except Exception:  # noqa: BLE001
             continue
         tracker.add_frame(bboxes, t0 + i * 2.0)
 
+    # --- Trajectory matching ---
     trajectories = tracker.get_trajectories()
-    if not trajectories:
-        return []
-
-    matches: list[str] = []
+    traj_matches: list[str] = []
+    unmatched: list[Trajectory] = []
     for traj in trajectories:
         if traj.is_stationary:
             continue
@@ -355,23 +386,55 @@ async def _track_trajectory(
                 camera=camera_name,
                 subject=result.matched_subject,
                 similarity=round(result.similarity, 3),
-                direction=round(traj.direction_angle or 0, 1),
-                speed=round(traj.speed_px_per_sec, 1),
             )
             assert result.matched_subject is not None
-            matches.append(result.matched_subject)
+            traj_matches.append(result.matched_subject)
         else:
-            state.trajectory_db.add(traj)
-            log.info(
-                "trajectory_unknown_saved",
-                camera=camera_name,
-                best_similarity=round(result.similarity, 3),
-                direction=round(traj.direction_angle or 0, 1),
-                speed=round(traj.speed_px_per_sec, 1),
-                entry=traj.entry_zone,
-                exit=traj.exit_zone,
-            )
-    return matches
+            unmatched.append(traj)
+
+    # --- Skeleton analysis (proportions + gait) ---
+    skel_matches: list[str] = []
+    try:
+        profile = state.skeleton_analyzer.build_profile(burst_snapshots)
+        if profile is not None:
+            vec = profile.to_vector()
+            skel_result = state.skeleton_matcher.match(vec)
+            if skel_result.is_known:
+                log.info(
+                    "skeleton_matched",
+                    camera=camera_name,
+                    subject=skel_result.matched_subject,
+                    similarity=round(skel_result.similarity, 3),
+                )
+                assert skel_result.matched_subject is not None
+                skel_matches.append(skel_result.matched_subject)
+            else:
+                props = profile.proportions
+                state.skeleton_db.add(
+                    camera=camera_name,
+                    profile_vector=vec,
+                    shoulder_ratio=props.shoulder_ratio if props else 0.0,
+                    torso_ratio=props.torso_ratio if props else 0.0,
+                    leg_ratio=props.leg_ratio if props else 0.0,
+                    arm_ratio=props.arm_ratio if props else 0.0,
+                    height_px=props.height_px if props else 0.0,
+                )
+                log.info(
+                    "skeleton_unknown_saved",
+                    camera=camera_name,
+                    best_similarity=round(skel_result.similarity, 3),
+                    proportions={
+                        "shoulder": round(props.shoulder_ratio, 3) if props else 0,
+                        "torso": round(props.torso_ratio, 3) if props else 0,
+                        "leg": round(props.leg_ratio, 3) if props else 0,
+                        "arm": round(props.arm_ratio, 3) if props else 0,
+                        "height_px": round(props.height_px, 1) if props else 0,
+                    },
+                )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("skeleton_analysis_failed", error=str(exc))
+
+    return traj_matches, unmatched, skel_matches
 
 
 def _detect_and_save_pets(snapshot: bytes, camera: str) -> None:
@@ -484,6 +547,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.trajectory_db = TrajectoryDB(settings.data_dir / "trajectories.db")
     state.trajectory_matcher = TrajectoryMatcher()
     state.trajectory_matcher.reload(state.trajectory_db.known_by_camera())
+    state.skeleton_analyzer = SkeletonAnalyzer()
+    state.skeleton_db = SkeletonDB(settings.data_dir / "skeletons.db")
+    state.skeleton_matcher = SkeletonMatcher()
+    state.skeleton_matcher.reload(state.skeleton_db.known_by_subject())
     state.protect = ProtectClient(
         host=settings.unifi_host,
         username=settings.unifi_user,

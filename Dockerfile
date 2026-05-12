@@ -32,11 +32,11 @@ RUN pip install --prefix=/install \
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     pip install --prefix=/install .
 
-# Pre-download YOLOv8 nano model so first inference is offline-capable
+# Pre-download YOLOv8 nano models (detection + pose)
 WORKDIR /build/models
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     YOLO_CONFIG_DIR=/tmp/Ultralytics \
-    python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
+    python -c "from ultralytics import YOLO; YOLO('yolov8n.pt'); YOLO('yolov8n-pose.pt')"
 
 # Pre-download ResNet18 pretrained weights (for Body Re-ID feature extraction)
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
@@ -67,6 +67,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /install /usr/local
 COPY --from=builder /build/models/yolov8n.pt /home/app/yolov8n.pt
+COPY --from=builder /build/models/yolov8n-pose.pt /home/app/yolov8n-pose.pt
 COPY --from=builder /build/.torch /home/app/.torch
 ENV TORCH_HOME=/home/app/.torch
 RUN chown -R 1000:1000 /home/app

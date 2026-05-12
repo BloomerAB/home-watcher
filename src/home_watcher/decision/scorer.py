@@ -34,6 +34,7 @@ class ScoringContext:
     body_person_count: int = 0
     family_members_home: list[str] = field(default_factory=list)
     trajectory_matches: list[str] = field(default_factory=list)
+    skeleton_matches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -87,12 +88,14 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
     )
 
     trajectory_matched = bool(ctx.trajectory_matches)
+    skeleton_matched = bool(ctx.skeleton_matches)
 
     # If any strong signal identifies all persons as family → KNOWN_FAMILY.
     recognized_by = (
         (all_faces_known and not any_unknown_face)
         or (all_bodies_matched and not any_unknown_face)
         or (trajectory_matched and not any_unknown_face)
+        or (skeleton_matched and not any_unknown_face)
     )
     if recognized_by:
         subjects: list[str] = []
@@ -100,8 +103,16 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
             subjects.extend(f.matched_subject for f in usable_faces if f.matched_subject)
         subjects.extend(ctx.body_matches)
         subjects.extend(ctx.trajectory_matches)
+        subjects.extend(ctx.skeleton_matches)
         unique_subjects = list(dict.fromkeys(subjects))
-        signal = "face" if all_faces_known else "body" if all_bodies_matched else "trajectory"
+        if all_faces_known:
+            signal = "face"
+        elif skeleton_matched:
+            signal = "skeleton"
+        elif trajectory_matched:
+            signal = "trajectory"
+        else:
+            signal = "body"
         return DecisionResult(
             decision=Decision.KNOWN_FAMILY,
             score=0.0,
