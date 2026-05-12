@@ -1580,12 +1580,20 @@ _INLINE_HTML = """<!doctype html>
 <html lang="sv">
 <head>
 <meta charset="utf-8">
-<title>home-watcher — labeling</title>
+<title>home-watcher</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;
-         margin: 0; padding: 1rem; background: #111; color: #eee; }
-  h1, h2 { margin-top: 0; }
-  h2 { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #333; }
+         margin: 0; padding: 0; background: #111; color: #eee; }
+  .tabs { display: flex; gap: 0; border-bottom: 2px solid #333; padding: 0 1rem; background: #181818; }
+  .tab { padding: 0.75rem 1.5rem; cursor: pointer; color: #888; border-bottom: 2px solid transparent;
+         margin-bottom: -2px; font-size: 0.95rem; }
+  .tab.active { color: #eee; border-bottom-color: #2563eb; }
+  .tab .badge { background: #dc2626; color: white; font-size: 0.7rem; padding: 0.1rem 0.4rem;
+                border-radius: 99px; margin-left: 0.4rem; vertical-align: middle; }
+  .page { display: none; padding: 1rem; }
+  .page.active { display: block; }
+  h2 { margin-top: 0; }
+  h3 { margin-top: 1.5rem; padding-top: 0.75rem; border-top: 1px solid #333; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; }
   .card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; }
   .card img { width: 100%; height: auto; border-radius: 4px; display: block; }
@@ -1599,62 +1607,113 @@ _INLINE_HTML = """<!doctype html>
   button:hover { opacity: 0.9; }
   details { margin-top: 0.5rem; font-size: 0.85rem; }
   details summary { cursor: pointer; color: #888; }
-  .known { font-size: 0.85rem; color: #888; margin-bottom: 1rem; }
   .tag { display: inline-block; background: #333; color: #ccc; padding: 0.1rem 0.4rem;
          border-radius: 3px; font-size: 0.75rem; margin-right: 0.25rem; }
+  .section { margin-bottom: 1.5rem; }
+  .empty-msg { color: #666; padding: 2rem; text-align: center; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .stat-card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 1rem; }
+  .stat-card h4 { margin: 0 0 0.5rem 0; font-size: 0.85rem; color: #888; text-transform: uppercase; }
+  .stat-card .value { font-size: 1.5rem; font-weight: 600; }
+  .stat-card .detail { font-size: 0.8rem; color: #666; margin-top: 0.25rem; }
 </style>
 </head>
 <body>
 
-<h1>Okända personer (kropp)</h1>
-<div class="known" id="known-bodies"></div>
-<div class="grid" id="grid-bodies"></div>
-
-<h2>Skeleton-validering (Protect-historik)</h2>
-<div class="known" id="known-skeletons"></div>
-<div style="margin-bottom:1rem">
-  <button onclick="loadProtectEvents()">Hämta person-events (7 dagar)</button>
-  <span id="event-status" style="color:#888;margin-left:0.5rem"></span>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('label')">Att labela <span class="badge" id="queue-badge" style="display:none">0</span></div>
+  <div class="tab" onclick="switchTab('admin')">Admin</div>
 </div>
-<div class="grid" id="grid-events"></div>
 
-<h2>Okända ansikten</h2>
-<div class="known" id="known-faces"></div>
-<div class="grid" id="grid-faces"></div>
-
-<h2>Rörelsemönster</h2>
-<div class="known" id="known-trajectories"></div>
-<div class="grid" id="grid-trajectories"></div>
-
-<h2>Okända djur</h2>
-<div class="known" id="known-pets"></div>
-<div style="margin-bottom:1rem">
-  <button onclick="backfillPets()">Sök djur i historik (30 dagar)</button>
-  <span id="pet-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+<div class="page active" id="page-label">
+  <div id="queue-empty" class="empty-msg" style="display:none">Inget att labela just nu.</div>
+  <div class="section" id="sec-bodies" style="display:none">
+    <h2>Okanda personer</h2>
+    <div class="grid" id="grid-bodies"></div>
+  </div>
+  <div class="section" id="sec-faces" style="display:none">
+    <h3>Okanda ansikten</h3>
+    <div class="grid" id="grid-faces"></div>
+  </div>
+  <div class="section" id="sec-vehicles" style="display:none">
+    <h3>Okanda fordon</h3>
+    <div class="grid" id="grid-vehicles"></div>
+  </div>
+  <div class="section" id="sec-pets" style="display:none">
+    <h3>Okanda djur</h3>
+    <div class="grid" id="grid-pets"></div>
+  </div>
+  <div class="section" id="sec-trajectories" style="display:none">
+    <h3>Okanda rorelsemonster</h3>
+    <div class="grid" id="grid-trajectories"></div>
+  </div>
 </div>
-<div class="grid" id="grid-pets"></div>
 
-<h2>Okända fordon</h2>
-<div class="known" id="known-vehicles"></div>
-<div style="margin-bottom:1rem">
-  <button onclick="backfillVehicles()">Sök fordon i historik (30 dagar)</button>
-  <span id="vehicle-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+<div class="page" id="page-admin">
+  <h2>Tranade modeller</h2>
+  <div class="stat-grid" id="stat-grid"></div>
+
+  <h3>Backfill fran Protect-historik</h3>
+  <div class="row" style="margin-bottom:1rem">
+    <button onclick="backfillPets()">Djur (30 dagar)</button>
+    <span id="pet-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+  </div>
+  <div class="row" style="margin-bottom:1rem">
+    <button onclick="backfillVehicles()">Fordon (30 dagar)</button>
+    <span id="vehicle-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+  </div>
+
+  <h3>Skeleton-validering (Protect-historik)</h3>
+  <div style="margin-bottom:1rem">
+    <button onclick="loadProtectEvents()">Hamta person-events (7 dagar)</button>
+    <span id="event-status" style="color:#888;margin-left:0.5rem"></span>
+  </div>
+  <div class="grid" id="grid-events"></div>
+
+  <h3>Reload alla modeller</h3>
+  <div class="row">
+    <button onclick="reloadModels()">Reload</button>
+    <span id="reload-status" style="color:#888;margin-left:0.5rem"></span>
+  </div>
 </div>
-<div class="grid" id="grid-vehicles"></div>
 
 <script>
-  async function loadKnown(url, target, prefix) {
-    const r = await fetch(url);
-    const data = await r.json();
-    const parts = Object.entries(data).map(([n, c]) => `${n} (${c})`);
-    target.textContent = parts.length ? prefix + ': ' + parts.join(', ') : 'Inga tränade än';
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.getElementById('page-' + name).classList.add('active');
+    document.querySelector(`.tab[onclick*="${name}"]`).classList.add('active');
+  }
+
+  let queueCounts = {};
+
+  function showSection(id, count) {
+    const sec = document.getElementById(id);
+    sec.style.display = count > 0 ? 'block' : 'none';
+    return count;
+  }
+
+  function updateQueueBadge() {
+    const total = Object.values(queueCounts).reduce((a, b) => a + b, 0);
+    const badge = document.getElementById('queue-badge');
+    const empty = document.getElementById('queue-empty');
+    if (total > 0) {
+      badge.textContent = total;
+      badge.style.display = 'inline';
+      empty.style.display = 'none';
+    } else {
+      badge.style.display = 'none';
+      empty.style.display = 'block';
+    }
   }
 
   async function loadFaces() {
     const r = await fetch('/api/unknown');
     const items = await r.json();
+    queueCounts.faces = items.length;
+    showSection('sec-faces', items.length);
     const grid = document.getElementById('grid-faces');
-    grid.innerHTML = items.length === 0 ? '<p>Inga okända ansikten i kön.</p>' : '';
+    grid.innerHTML = '';
     for (const f of items) {
       const card = document.createElement('div');
       card.className = 'card';
@@ -1662,10 +1721,10 @@ _INLINE_HTML = """<!doctype html>
         <img src="${f.crop_url}" alt="face">
         <div class="meta">${f.camera} — ${new Date(f.detected_at).toLocaleString('sv-SE')} — ${f.width_px}px</div>
         <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malin)" id="fn-${f.id}">
+          <input type="text" placeholder="Namn" id="fn-${f.id}">
           <button onclick="labelFace(${f.id})">Spara</button>
+          <button class="secondary" onclick="discardFace(${f.id})">Skippa</button>
         </div>
-        <div class="row"><button class="secondary" onclick="discardFace(${f.id})">Skippa</button></div>
         <details><summary>Full bild</summary><img src="${f.snapshot_url}" style="margin-top:0.5rem"></details>`;
       grid.appendChild(card);
     }
@@ -1674,8 +1733,10 @@ _INLINE_HTML = """<!doctype html>
   async function loadPets() {
     const r = await fetch('/api/pets/unknown');
     const items = await r.json();
+    queueCounts.pets = items.length;
+    showSection('sec-pets', items.length);
     const grid = document.getElementById('grid-pets');
-    grid.innerHTML = items.length === 0 ? '<p>Inga okända djur i kön.</p>' : '';
+    grid.innerHTML = '';
     for (const p of items) {
       const card = document.createElement('div');
       card.className = 'card';
@@ -1687,11 +1748,117 @@ _INLINE_HTML = """<!doctype html>
           ${p.camera} — ${new Date(p.detected_at).toLocaleString('sv-SE')}
         </div>
         <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Bella)" id="pn-${p.id}">
+          <input type="text" placeholder="Namn (t.ex. Semla)" id="pn-${p.id}">
           <button onclick="labelPet(${p.id})">Spara</button>
+          <button class="secondary" onclick="discardPet(${p.id})">Skippa</button>
         </div>
-        <div class="row"><button class="secondary" onclick="discardPet(${p.id})">Skippa</button></div>
         <details><summary>Full bild</summary><img src="${p.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+
+  async function loadVehicles() {
+    const r = await fetch('/api/vehicles/unknown');
+    const items = await r.json();
+    queueCounts.vehicles = items.length;
+    showSection('sec-vehicles', items.length);
+    const grid = document.getElementById('grid-vehicles');
+    grid.innerHTML = '';
+    for (const v of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${v.crop_url}" alt="vehicle">
+        <div class="meta">
+          <span class="tag">${v.vehicle_class}</span>
+          <span class="tag">${Math.round(v.confidence*100)}%</span>
+          ${v.camera} — ${new Date(v.detected_at).toLocaleString('sv-SE')}
+        </div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Malins bil)" id="vn-${v.id}">
+          <button onclick="labelVehicle(${v.id})">Spara</button>
+          <button class="secondary" onclick="discardVehicle(${v.id})">Skippa</button>
+        </div>
+        <details><summary>Full bild</summary><img src="${v.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+
+  async function loadBodies() {
+    const r = await fetch('/api/bodies/unknown');
+    const items = await r.json();
+    queueCounts.bodies = items.length;
+    showSection('sec-bodies', items.length);
+    const grid = document.getElementById('grid-bodies');
+    grid.innerHTML = '';
+    for (const b of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${b.crop_url}" alt="body">
+        <div class="meta">${b.camera} — ${new Date(b.detected_at).toLocaleString('sv-SE')} — ${b.width_px}x${b.height_px}px</div>
+        <div class="row">
+          <input type="text" placeholder="Namn" id="bn-${b.id}">
+          <button onclick="labelBody(${b.id})">Spara</button>
+          <button class="secondary" onclick="discardBody(${b.id})">Skippa</button>
+        </div>
+        <details><summary>Full bild</summary><img src="${b.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+
+  async function loadTrajectories() {
+    const r = await fetch('/api/trajectories/unknown');
+    const items = await r.json();
+    queueCounts.trajectories = items.length;
+    showSection('sec-trajectories', items.length);
+    const grid = document.getElementById('grid-trajectories');
+    grid.innerHTML = '';
+    for (const t of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const dir = t.direction_angle !== null ? Math.round(t.direction_angle) + ' grader' : 'stillastaende';
+      card.innerHTML = `
+        <div class="meta">${t.camera} — ${new Date(t.detected_at).toLocaleString('sv-SE')}</div>
+        <div class="meta">Riktning: ${dir} — Hastighet: ${t.speed} px/s</div>
+        <div class="meta">In: zon ${t.entry_zone} — Ut: zon ${t.exit_zone}</div>
+        <div class="row">
+          <input type="text" placeholder="Namn" id="tn-${t.id}">
+          <button onclick="labelTraj(${t.id})">Spara</button>
+          <button class="secondary" onclick="discardTraj(${t.id})">Skippa</button>
+        </div>`;
+      grid.appendChild(card);
+    }
+  }
+
+  async function loadStats() {
+    const [faces, bodies, pets, vehicles, trajectories, skeletons] = await Promise.all([
+      fetch('/api/subjects').then(r => r.json()),
+      fetch('/api/bodies/subjects').then(r => r.json()),
+      fetch('/api/pets/subjects').then(r => r.json()),
+      fetch('/api/vehicles/subjects').then(r => r.json()),
+      fetch('/api/trajectories/subjects').then(r => r.json()),
+      fetch('/api/skeletons/known').then(r => r.json()),
+    ]);
+    const grid = document.getElementById('stat-grid');
+    grid.innerHTML = '';
+    const stats = [
+      { title: 'Ansikten', data: faces },
+      { title: 'Kroppar', data: bodies },
+      { title: 'Skelett', data: skeletons },
+      { title: 'Rorelser', data: trajectories },
+      { title: 'Djur', data: pets },
+      { title: 'Fordon', data: vehicles },
+    ];
+    for (const s of stats) {
+      const entries = Object.entries(s.data);
+      const total = entries.reduce((a, [, c]) => a + c, 0);
+      const card = document.createElement('div');
+      card.className = 'stat-card';
+      card.innerHTML = `<h4>${s.title}</h4>
+        <div class="value">${entries.length} subjekt</div>
+        <div class="detail">${total} profiler totalt</div>
+        <div class="detail">${entries.map(([n,c]) => n + ' (' + c + ')').join(', ') || 'Inga tranade'}</div>`;
       grid.appendChild(card);
     }
   }
@@ -1716,34 +1883,11 @@ _INLINE_HTML = """<!doctype html>
     const r = await postLabel(`/api/pets/unknown/${id}/label`, id, name);
     if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
-  async function discardFace(id) {
-    await fetch(`/api/unknown/${id}`, {method: 'DELETE'});
-    await loadFaces();
-  }
-  async function discardPet(id) {
-    await fetch(`/api/pets/unknown/${id}`, {method: 'DELETE'});
-    await loadPets();
-  }
-
-  async function loadBodies() {
-    const r = await fetch('/api/bodies/unknown');
-    const items = await r.json();
-    const grid = document.getElementById('grid-bodies');
-    grid.innerHTML = items.length === 0 ? '<p>Inga okända personer i kön.</p>' : '';
-    for (const b of items) {
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = `
-        <img src="${b.crop_url}" alt="body">
-        <div class="meta">${b.camera} — ${new Date(b.detected_at).toLocaleString('sv-SE')} — ${b.width_px}×${b.height_px}px</div>
-        <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malin)" id="bn-${b.id}">
-          <button onclick="labelBody(${b.id})">Spara</button>
-        </div>
-        <div class="row"><button class="secondary" onclick="discardBody(${b.id})">Skippa</button></div>
-        <details><summary>Full bild</summary><img src="${b.snapshot_url}" style="margin-top:0.5rem"></details>`;
-      grid.appendChild(card);
-    }
+  async function labelVehicle(id) {
+    const name = document.getElementById('vn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/vehicles/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
   async function labelBody(id) {
     const name = document.getElementById('bn-' + id).value.trim();
@@ -1751,46 +1895,36 @@ _INLINE_HTML = """<!doctype html>
     const r = await postLabel(`/api/bodies/unknown/${id}/label`, id, name);
     if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
-  async function discardBody(id) {
-    await fetch(`/api/bodies/unknown/${id}`, {method: 'DELETE'});
-    await loadBodies();
-  }
-
-  async function loadTrajectories() {
-    const r = await fetch('/api/trajectories/unknown');
-    const items = await r.json();
-    const grid = document.getElementById('grid-trajectories');
-    grid.innerHTML = items.length === 0 ? '<p>Inga okända rörelser i kön.</p>' : '';
-    for (const t of items) {
-      const card = document.createElement('div');
-      card.className = 'card';
-      const dir = t.direction_angle !== null ? Math.round(t.direction_angle) + '°' : 'stillastående';
-      card.innerHTML = `
-        <div class="meta">${t.camera} — ${new Date(t.detected_at).toLocaleString('sv-SE')}</div>
-        <div class="meta">Riktning: ${dir} — Hastighet: ${t.speed} px/s</div>
-        <div class="meta">In: zon ${t.entry_zone} — Ut: zon ${t.exit_zone}</div>
-        <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malin)" id="tn-${t.id}">
-          <button onclick="labelTraj(${t.id})">Spara</button>
-        </div>
-        <div class="row"><button class="secondary" onclick="discardTraj(${t.id})">Skippa</button></div>`;
-      grid.appendChild(card);
-    }
-  }
   async function labelTraj(id) {
     const name = document.getElementById('tn-' + id).value.trim();
     if (!name) { alert('Ange namn'); return; }
     const r = await postLabel(`/api/trajectories/unknown/${id}/label`, id, name);
     if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
+  async function discardFace(id) {
+    await fetch(`/api/unknown/${id}`, {method: 'DELETE'});
+    await refresh();
+  }
+  async function discardPet(id) {
+    await fetch(`/api/pets/unknown/${id}`, {method: 'DELETE'});
+    await refresh();
+  }
+  async function discardVehicle(id) {
+    await fetch(`/api/vehicles/unknown/${id}`, {method: 'DELETE'});
+    await refresh();
+  }
+  async function discardBody(id) {
+    await fetch(`/api/bodies/unknown/${id}`, {method: 'DELETE'});
+    await refresh();
+  }
   async function discardTraj(id) {
     await fetch(`/api/trajectories/unknown/${id}`, {method: 'DELETE'});
-    await loadTrajectories();
+    await refresh();
   }
 
   async function loadProtectEvents() {
     const status = document.getElementById('event-status');
-    status.textContent = 'Hämtar events...';
+    status.textContent = 'Hamtar events...';
     const r = await fetch('/api/protect/events?days=7&limit=200');
     const events = await r.json();
     const grid = document.getElementById('grid-events');
@@ -1826,12 +1960,12 @@ _INLINE_HTML = """<!doctype html>
     });
     if (r.ok) {
       card.remove();
-      loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler');
+      loadStats();
     } else {
       card.style.opacity = '1';
       const err = await r.json().catch(() => ({}));
       card.querySelector('.meta').insertAdjacentHTML('afterend',
-        '<div style="color:#f87171;font-size:0.85rem">✗ ' + (err.detail || r.status) + '</div>');
+        '<div style="color:#f87171;font-size:0.85rem">Fel: ' + (err.detail || r.status) + '</div>');
     }
   }
   async function labelEventCustom(eventId, camera) {
@@ -1840,76 +1974,45 @@ _INLINE_HTML = """<!doctype html>
     await labelEvent(eventId, camera, name);
   }
   function skipEvent(eventId) {
-    const card = document.getElementById('ev-' + eventId);
-    card.remove();
+    document.getElementById('ev-' + eventId).remove();
   }
 
   async function backfillPets() {
     const status = document.getElementById('pet-backfill-status');
-    status.textContent = 'Söker djur i gamla events...';
+    status.textContent = 'Soker djur i gamla events...';
     const r = await fetch('/api/pets/backfill?days=30&limit=500', {method: 'POST'});
     const d = await r.json();
-    status.textContent = `Klart: ${d.pets_found} djur hittade i ${d.events_scanned} events`;
-    await loadPets();
-  }
-
-  async function loadVehicles() {
-    const r = await fetch('/api/vehicles/unknown');
-    const items = await r.json();
-    const grid = document.getElementById('grid-vehicles');
-    grid.innerHTML = items.length === 0 ? '<p>Inga okända fordon i kön.</p>' : '';
-    for (const v of items) {
-      const card = document.createElement('div');
-      card.className = 'card';
-      card.innerHTML = `
-        <img src="${v.crop_url}" alt="vehicle">
-        <div class="meta">
-          <span class="tag">${v.vehicle_class}</span>
-          <span class="tag">${Math.round(v.confidence*100)}%</span>
-          ${v.camera} — ${new Date(v.detected_at).toLocaleString('sv-SE')}
-        </div>
-        <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malins bil)" id="vn-${v.id}">
-          <button onclick="labelVehicle(${v.id})">Spara</button>
-        </div>
-        <div class="row"><button class="secondary" onclick="discardVehicle(${v.id})">Skippa</button></div>
-        <details><summary>Full bild</summary><img src="${v.snapshot_url}" style="margin-top:0.5rem"></details>`;
-      grid.appendChild(card);
-    }
-  }
-  async function labelVehicle(id) {
-    const name = document.getElementById('vn-' + id).value.trim();
-    if (!name) { alert('Ange namn'); return; }
-    const r = await postLabel(`/api/vehicles/unknown/${id}/label`, id, name);
-    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
-  }
-  async function discardVehicle(id) {
-    await fetch(`/api/vehicles/unknown/${id}`, {method: 'DELETE'});
-    await loadVehicles();
+    status.textContent = 'Klart: ' + d.pets_found + ' djur hittade i ' + d.events_scanned + ' events';
+    await refresh();
   }
   async function backfillVehicles() {
     const status = document.getElementById('vehicle-backfill-status');
-    status.textContent = 'Söker fordon i gamla events...';
+    status.textContent = 'Soker fordon i gamla events...';
     const r = await fetch('/api/vehicles/backfill?days=30&limit=500', {method: 'POST'});
     const d = await r.json();
-    status.textContent = `Klart: ${d.vehicles_found} fordon hittade i ${d.events_scanned} events`;
-    await loadVehicles();
+    status.textContent = 'Klart: ' + d.vehicles_found + ' fordon hittade i ' + d.events_scanned + ' events';
+    await refresh();
+  }
+  async function reloadModels() {
+    const status = document.getElementById('reload-status');
+    status.textContent = 'Laddar om...';
+    const r = await fetch('/api/reload', {method: 'POST'});
+    const d = await r.json();
+    status.textContent = 'Klart!';
+    await loadStats();
+    setTimeout(() => { status.textContent = ''; }, 3000);
   }
 
   async function refresh() {
     await Promise.all([
-      loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
-      loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
-      loadKnown('/api/vehicles/subjects', document.getElementById('known-vehicles'), 'Tränade fordon'),
-      loadKnown('/api/bodies/subjects', document.getElementById('known-bodies'), 'Tränade personer'),
-      loadKnown('/api/trajectories/subjects', document.getElementById('known-trajectories'), 'Tränade rörelser'),
-      loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler'),
       loadFaces(),
       loadPets(),
       loadVehicles(),
       loadBodies(),
       loadTrajectories(),
+      loadStats(),
     ]);
+    updateQueueBadge();
   }
   refresh();
   setInterval(refresh, 30000);
