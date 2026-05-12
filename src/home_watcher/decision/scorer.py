@@ -31,10 +31,9 @@ class ScoringContext:
     family_at_home: bool
     camera_cfg: CameraConfig
     body_matches: list[str] = field(default_factory=list)
-    """Subject names matched by Body Re-ID (e.g. ['Malin']). Empty if no
-    person bboxes matched a known body."""
     body_person_count: int = 0
-    """Total persons detected by YOLO (matched + unmatched)."""
+    family_members_home: list[str] = field(default_factory=list)
+    """Names of family members whose phones are on WiFi right now."""
 
 
 @dataclass
@@ -104,30 +103,54 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
             matched_subjects=unique_subjects,
         )
 
-    if any_unknown_face:
+    # 3b. Presence-count matching: if the number of detected persons matches
+    # or is fewer than family phones on WiFi, it's very likely all family.
+    n_family_home = len(ctx.family_members_home)
+    n_persons = max(ctx.body_person_count, 1)
+
+    if n_family_home > 0 and n_persons <= n_family_home and not any_unknown_face:
+        return DecisionResult(
+            decision=Decision.KNOWN_FAMILY,
+            score=0.0,
+            reasons=[
+                f"presence-count: {n_persons} person(s) detected, "
+                f"{n_family_home} family phone(s) home "
+                f"({', '.join(ctx.family_members_home)})",
+            ],
+            matched_subjects=ctx.family_members_home,
+        )
+
+    # 3c. More persons than family phones → some are unknown
+    if n_family_home > 0 and n_persons > n_family_home:
+        extra = n_persons - n_family_home
+        score += 0.6
+        reasons.append(
+            f"{extra} unknown person(s) beyond {n_family_home} family phone(s) home"
+        )
+    elif any_unknown_face:
         score += 0.7
         reasons.append(f"unknown face detected (width≥{min_face_width_px}px)")
+    elif not ctx.family_at_home:
+        score += 0.7
+        reasons.append("person detected, no family phones on WiFi")
     elif ctx.body_person_count > 0 and not ctx.body_matches:
-        score += 0.5
-        reasons.append("person body detected but did not match any known family")
-    elif not ctx.faces and ctx.body_person_count == 0:
         score += 0.3
-        reasons.append("no face or body detected — person present but unclear")
+        reasons.append("person detected, family home but no body match")
     else:
         score += 0.3
-        reasons.append(f"only small faces (<{min_face_width_px}px)")
+        reasons.append("person present but unclear identification")
 
-    # 3b. Time of day
+    # 3d. Time of day
     if ctx.now.hour in NIGHT_HOURS:
         score += 0.4
         reasons.append(f"night hour ({ctx.now.hour:02d}:00)")
 
-    # 3c. Family presence
+    # 3e. No family at home — strongest contextual signal
     if not ctx.family_at_home:
         score += 0.3
         reasons.append("no family at home")
 
-    # 3d. Camera weight
+    # 3f. Camera weight
     if ctx.camera_cfg.alert_weight > 0:
         score += ctx.camera_cfg.alert_weight
         reasons.append(f"camera alert_weight=+{ctx.camera_cfg.alert_weight}")

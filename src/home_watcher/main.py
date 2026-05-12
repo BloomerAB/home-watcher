@@ -146,7 +146,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
         body_matches = _identify_bodies(person_bboxes, snapshot, camera_name, camera_id)
     if "animal" in sd_types:
         _detect_and_save_pets(snapshot, camera_name)
-    family_home = await state.presence.family_at_home()
+    family_members = await state.presence.family_members_at_home()
+    family_home = len(family_members) > 0
     camera_cfg = state.cameras.get(camera_name, CameraConfig())
 
     ctx = ScoringContext(
@@ -159,6 +160,7 @@ async def _handle_event(update: ProtectUpdate) -> None:
         camera_cfg=camera_cfg,
         body_matches=body_matches,
         body_person_count=len(person_bboxes),
+        family_members_home=family_members,
     )
     result = decide(
         ctx,

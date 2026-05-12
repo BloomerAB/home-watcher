@@ -28,15 +28,22 @@ def _ctx(
     now: datetime | None = None,
     family_at_home: bool = True,
     camera_cfg: CameraConfig | None = None,
+    body_person_count: int = 0,
+    body_matches: list[str] | None = None,
+    family_members_home: list[str] | None = None,
 ) -> ScoringContext:
+    members = family_members_home or (["Malin"] if family_at_home else [])
     return ScoringContext(
         camera_id="cam1",
         camera_name=camera_name,
         smart_detect_types=smart_detect_types or ["person"],
         faces=faces or [],
-        now=now or datetime(2026, 5, 11, 14, 0),  # midday, default
+        now=now or datetime(2026, 5, 11, 14, 0),
         family_at_home=family_at_home,
         camera_cfg=camera_cfg or CameraConfig(),
+        body_person_count=body_person_count,
+        body_matches=body_matches or [],
+        family_members_home=members,
     )
 
 
@@ -91,14 +98,14 @@ def test_unknown_face_at_daytime_with_family_home() -> None:
     assert result.score >= 0.7
 
 
-def test_no_face_visible_with_family_home_daytime_low_camera_weight() -> None:
-    """No face = 0.3, family home = 0, midday = 0, default camera = 0 → below 0.6."""
+def test_no_face_visible_with_family_home_known_via_presence() -> None:
+    """No face but family phone on WiFi + 1 person → presence-count match."""
     result = decide(
         _ctx(faces=[], family_at_home=True),
         alert_threshold=0.6,
         min_face_width_px=60,
     )
-    assert result.decision == Decision.SILENT
+    assert result.decision == Decision.KNOWN_FAMILY
 
 
 def test_no_face_at_night_no_family_home() -> None:
@@ -116,26 +123,36 @@ def test_no_face_at_night_no_family_home() -> None:
     assert result.score >= 0.9
 
 
-def test_small_face_under_threshold_treated_as_no_face() -> None:
-    """Face width 40px (< 60px threshold) means we can't trust the match."""
+def test_small_face_under_threshold_still_known_via_presence() -> None:
+    """Face too small to trust, but presence-count still matches → known family."""
     small_known = _face(known=True, width=40)
     result = decide(
         _ctx(faces=[small_known], family_at_home=True),
         alert_threshold=0.6,
         min_face_width_px=60,
     )
-    # Not KNOWN_FAMILY because face is too small to trust
+    assert result.decision == Decision.KNOWN_FAMILY
+
+
+def test_small_face_no_family_home_not_known() -> None:
+    """Face too small and no phones home → not KNOWN_FAMILY."""
+    small_known = _face(known=True, width=40)
+    result = decide(
+        _ctx(faces=[small_known], family_at_home=False, family_members_home=[]),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
     assert result.decision != Decision.KNOWN_FAMILY
 
 
 def test_camera_alert_weight_increases_score() -> None:
+    """Camera weight matters when no family phones are home."""
     high_weight = CameraConfig(alert_weight=0.5)
     result = decide(
-        _ctx(faces=[], family_at_home=True, camera_cfg=high_weight),
+        _ctx(faces=[], family_at_home=False, family_members_home=[], camera_cfg=high_weight),
         alert_threshold=0.6,
         min_face_width_px=60,
     )
-    # No-face 0.3 + weight 0.5 = 0.8 → alert
     assert result.decision == Decision.ALERT
 
 
@@ -161,9 +178,82 @@ def test_no_relevant_object_ignored() -> None:
 @pytest.mark.parametrize("hour", [22, 23, 0, 3, 5])
 def test_night_hours_add_score(hour: int) -> None:
     result = decide(
-        _ctx(faces=[], family_at_home=True, now=datetime(2026, 5, 11, hour, 0)),
+        _ctx(
+            faces=[],
+            now=datetime(2026, 5, 11, hour, 0),
+            family_at_home=False,
+            family_members_home=[],
+        ),
         alert_threshold=0.6,
         min_face_width_px=60,
     )
-    # No face 0.3 + night 0.4 = 0.7
     assert result.score >= 0.7
+
+
+def test_presence_count_1_person_2_phones_known_family() -> None:
+    """1 person detected, 2 family phones home → known family."""
+    result = decide(
+        _ctx(
+            body_person_count=1,
+            family_members_home=["Malin", "Madde"],
+        ),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
+    assert result.decision == Decision.KNOWN_FAMILY
+    assert "presence-count" in result.reasons[0]
+
+
+def test_presence_count_equal_persons_and_phones() -> None:
+    """3 persons, 3 phones → all accounted for."""
+    result = decide(
+        _ctx(
+            body_person_count=3,
+            family_members_home=["Malin", "Madde", "Loe"],
+        ),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
+    assert result.decision == Decision.KNOWN_FAMILY
+
+
+def test_presence_count_more_persons_than_phones_alerts() -> None:
+    """4 persons but only 2 phones → 2 unknown people."""
+    result = decide(
+        _ctx(
+            body_person_count=4,
+            family_members_home=["Malin", "Madde"],
+        ),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
+    assert result.decision == Decision.ALERT
+    assert any("beyond" in r for r in result.reasons)
+
+
+def test_presence_count_no_phones_home_alerts() -> None:
+    """Person detected, no family phones → alert."""
+    result = decide(
+        _ctx(
+            body_person_count=1,
+            family_at_home=False,
+            family_members_home=[],
+        ),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
+    assert result.decision == Decision.ALERT
+
+
+def test_presence_count_blocked_by_unknown_face() -> None:
+    """Even if phones match count, unknown face overrides."""
+    result = decide(
+        _ctx(
+            body_person_count=1,
+            faces=[_face(known=False)],
+            family_members_home=["Malin"],
+        ),
+        alert_threshold=0.6,
+        min_face_width_px=60,
+    )
+    assert result.decision != Decision.KNOWN_FAMILY
