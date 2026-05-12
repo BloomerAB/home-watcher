@@ -73,6 +73,7 @@ class AppState:
     last_body_saved: dict[str, float] = {}
     body_save_interval_seconds: float = 10.0
     min_body_crop_px: int = 40
+    analyzed_event_ids: set[str] = set()
 
 
 state = AppState()
@@ -1038,6 +1039,7 @@ async def list_protect_events(
         }
         for ev in events
         if "person" in ev.get("smartDetectTypes", [])
+        and ev.get("id") not in s.analyzed_event_ids
     ]
 
 
@@ -1096,6 +1098,7 @@ async def analyze_event_skeleton(
         subject=subject,
     )
     s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
+    s.analyzed_event_ids.add(event_id)
     return {
         "id": row_id,
         "subject": subject,
@@ -1454,12 +1457,13 @@ _INLINE_HTML = """<!doctype html>
       body: JSON.stringify({subject: name, camera: camera}),
     });
     if (r.ok) {
-      const d = await r.json();
-      card.innerHTML = '<div class="meta" style="color:#4ade80">✓ ' + name + ' (h=' + d.height_px + 'px)</div>';
+      card.remove();
       loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler');
     } else {
+      card.style.opacity = '1';
       const err = await r.json().catch(() => ({}));
-      card.innerHTML = '<div class="meta" style="color:#f87171">✗ ' + (err.detail || r.status) + '</div>';
+      card.querySelector('.meta').insertAdjacentHTML('afterend',
+        '<div style="color:#f87171;font-size:0.85rem">✗ ' + (err.detail || r.status) + '</div>');
     }
   }
   async function labelEventCustom(eventId, camera) {
