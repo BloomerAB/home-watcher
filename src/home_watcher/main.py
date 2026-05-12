@@ -1580,42 +1580,55 @@ _INLINE_HTML = """<!doctype html>
 <html lang="sv">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>home-watcher</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;
-         margin: 0; padding: 0; background: #111; color: #eee; }
-  .tabs { display: flex; gap: 0; border-bottom: 2px solid #333; padding: 0 1rem; background: #181818; }
-  .tab { padding: 0.75rem 1.5rem; cursor: pointer; color: #888; border-bottom: 2px solid transparent;
+         margin: 0; padding: 0; background: #111; color: #eee; -webkit-text-size-adjust: 100%; }
+  .tabs { display: flex; gap: 0; border-bottom: 2px solid #333; padding: 0 0.5rem; background: #181818;
+          position: sticky; top: 0; z-index: 10; }
+  .tab { padding: 0.75rem 1.25rem; cursor: pointer; color: #888; border-bottom: 2px solid transparent;
          margin-bottom: -2px; font-size: 0.95rem; }
   .tab.active { color: #eee; border-bottom-color: #2563eb; }
   .tab .badge { background: #dc2626; color: white; font-size: 0.7rem; padding: 0.1rem 0.4rem;
                 border-radius: 99px; margin-left: 0.4rem; vertical-align: middle; }
-  .page { display: none; padding: 1rem; }
+  .page { display: none; padding: 0.75rem; }
   .page.active { display: block; }
   h2 { margin-top: 0; }
   h3 { margin-top: 1.5rem; padding-top: 0.75rem; border-top: 1px solid #333; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 1rem; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 0.75rem; }
   .card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; }
+  .card .crop-wrap { width: 100%; height: 180px; overflow: hidden; border-radius: 4px;
+                     display: flex; align-items: center; justify-content: center; background: #0a0a0a; }
+  .card .crop-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .card img { width: 100%; height: auto; border-radius: 4px; display: block; }
   .meta { font-size: 0.85rem; color: #999; margin: 0.5rem 0; }
-  .row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
-  input[type=text] { flex: 1; padding: 0.4rem 0.6rem; background: #2a2a2a; color: #eee;
-                     border: 1px solid #444; border-radius: 4px; }
-  button { padding: 0.4rem 0.8rem; border: none; border-radius: 4px;
-           background: #2563eb; color: white; cursor: pointer; }
+  .row { display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 0; padding: 0.5rem 0.6rem; background: #2a2a2a; color: #eee;
+                     border: 1px solid #444; border-radius: 4px; font-size: 1rem; }
+  button { padding: 0.5rem 1rem; border: none; border-radius: 4px;
+           background: #2563eb; color: white; cursor: pointer; font-size: 0.9rem;
+           touch-action: manipulation; }
   button.secondary { background: #444; }
   button:hover { opacity: 0.9; }
+  button:active { opacity: 0.7; }
   details { margin-top: 0.5rem; font-size: 0.85rem; }
   details summary { cursor: pointer; color: #888; }
-  .tag { display: inline-block; background: #333; color: #ccc; padding: 0.1rem 0.4rem;
+  .tag { display: inline-block; background: #333; color: #ccc; padding: 0.15rem 0.5rem;
          border-radius: 3px; font-size: 0.75rem; margin-right: 0.25rem; }
   .section { margin-bottom: 1.5rem; }
   .empty-msg { color: #666; padding: 2rem; text-align: center; }
-  .stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
-  .stat-card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 1rem; }
-  .stat-card h4 { margin: 0 0 0.5rem 0; font-size: 0.85rem; color: #888; text-transform: uppercase; }
-  .stat-card .value { font-size: 1.5rem; font-weight: 600; }
-  .stat-card .detail { font-size: 0.8rem; color: #666; margin-top: 0.25rem; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 1.5rem; }
+  .stat-card { background: #1c1c1c; border: 1px solid #333; border-radius: 8px; padding: 0.75rem; }
+  .stat-card h4 { margin: 0 0 0.5rem 0; font-size: 0.8rem; color: #888; text-transform: uppercase; }
+  .stat-card .value { font-size: 1.3rem; font-weight: 600; }
+  .stat-card .detail { font-size: 0.75rem; color: #666; margin-top: 0.25rem; word-break: break-word; }
+  @media (min-width: 640px) {
+    .grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .stat-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+    .page { padding: 1rem; }
+    .tabs { padding: 0 1rem; }
+  }
 </style>
 </head>
 <body>
@@ -1725,7 +1738,7 @@ _INLINE_HTML = """<!doctype html>
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `
-        <img src="${f.crop_url}" alt="face">
+        <div class="crop-wrap"><img src="${f.crop_url}" alt="face"></div>
         <div class="meta">${f.camera} — ${new Date(f.detected_at).toLocaleString('sv-SE')} — ${f.width_px}px</div>
         <div class="row">
           <input type="text" placeholder="Namn" id="fn-${f.id}" list="person-suggestions">
@@ -1748,7 +1761,7 @@ _INLINE_HTML = """<!doctype html>
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `
-        <img src="${p.crop_url}" alt="pet">
+        <div class="crop-wrap"><img src="${p.crop_url}" alt="pet"></div>
         <div class="meta">
           <span class="tag">${p.species}</span>
           <span class="tag">${Math.round(p.confidence*100)}%</span>
@@ -1779,7 +1792,7 @@ _INLINE_HTML = """<!doctype html>
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `
-        <img src="${v.crop_url}" alt="vehicle">
+        <div class="crop-wrap"><img src="${v.crop_url}" alt="vehicle"></div>
         <div class="meta">
           <span class="tag">${v.vehicle_class}</span>
           <span class="tag">${Math.round(v.confidence*100)}%</span>
@@ -1806,7 +1819,7 @@ _INLINE_HTML = """<!doctype html>
       const card = document.createElement('div');
       card.className = 'card';
       card.innerHTML = `
-        <img src="${b.crop_url}" alt="body">
+        <div class="crop-wrap"><img src="${b.crop_url}" alt="body"></div>
         <div class="meta">${b.camera} — ${new Date(b.detected_at).toLocaleString('sv-SE')} — ${b.width_px}x${b.height_px}px</div>
         <div class="row">
           <input type="text" placeholder="Namn" id="bn-${b.id}" list="person-suggestions">
