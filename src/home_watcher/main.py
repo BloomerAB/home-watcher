@@ -959,6 +959,154 @@ async def discard_unknown_trajectory(
     return {"status": "discarded"}
 
 
+@app.get("/api/skeletons/known")
+async def list_skeleton_subjects(
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, int]:
+    known = s.skeleton_db.known_by_subject()
+    return {subj: len(vecs) for subj, vecs in known.items()}
+
+
+@app.get("/api/skeletons/unknown")
+async def list_unknown_skeletons(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 50
+) -> list[dict[str, object]]:
+    rows = s.skeleton_db.list_unknown(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at,
+            "camera": r.camera,
+            "shoulder_ratio": round(r.shoulder_ratio, 3),
+            "torso_ratio": round(r.torso_ratio, 3),
+            "leg_ratio": round(r.leg_ratio, 3),
+            "arm_ratio": round(r.arm_ratio, 3),
+            "height_px": round(r.height_px),
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/skeletons/unknown/{skel_id}/label")
+async def label_skeleton(
+    skel_id: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.skeleton_db.get(skel_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    s.skeleton_db.label(skel_id, subject)
+    s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
+    return {"id": skel_id, "subject": subject}
+
+
+@app.delete("/api/skeletons/unknown/{skel_id}")
+async def discard_skeleton(
+    skel_id: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.skeleton_db.get(skel_id) is None:
+        raise HTTPException(status_code=404)
+    s.skeleton_db.discard(skel_id)
+    return {"status": "discarded"}
+
+
+@app.get("/api/protect/events")
+async def list_protect_events(
+    s: Annotated[AppState, Depends(_get_state)],
+    days: int = 7,
+    limit: int = 200,
+) -> list[dict[str, object]]:
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
+    start_ms = now_ms - days * 24 * 3600 * 1000
+    events = await s.protect.list_events(
+        start_ms, now_ms, types=["smartDetectZone"], limit=limit,
+    )
+    return [
+        {
+            "id": ev.get("id"),
+            "camera": s.protect.camera_name(ev.get("camera", "")),
+            "camera_id": ev.get("camera"),
+            "start": ev.get("start"),
+            "smart_detect_types": ev.get("smartDetectTypes", []),
+            "thumbnail_url": f"/api/protect/events/{ev['id']}/thumbnail",
+        }
+        for ev in events
+        if "person" in ev.get("smartDetectTypes", [])
+    ]
+
+
+@app.get("/api/protect/events/{event_id}/thumbnail")
+async def protect_event_thumbnail(
+    event_id: str, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import Response
+
+    thumb = await s.protect.fetch_event_thumbnail(event_id)
+    if thumb is None:
+        raise HTTPException(status_code=404, detail="thumbnail not found")
+    return Response(content=thumb, media_type="image/jpeg")
+
+
+@app.post("/api/protect/events/{event_id}/analyze-skeleton")
+async def analyze_event_skeleton(
+    event_id: str,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, object]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+
+    thumb = await s.protect.fetch_event_thumbnail(event_id)
+    if thumb is None:
+        raise HTTPException(status_code=404, detail="thumbnail not found")
+
+    import numpy as np
+
+    kps = s.skeleton_analyzer.detect_keypoints(thumb)
+    if not kps:
+        raise HTTPException(status_code=422, detail="no keypoints detected")
+    props = s.skeleton_analyzer.extract_proportions(kps[0])
+    if props is None:
+        raise HTTPException(status_code=422, detail="could not extract proportions")
+
+    vec = np.array(
+        [props.shoulder_ratio, props.torso_ratio, props.leg_ratio, props.arm_ratio],
+        dtype=np.float32,
+    )
+    norm = float(np.linalg.norm(vec))
+    if norm > 0:
+        vec = vec / norm
+
+    camera = body.get("camera", "unknown")
+    row_id = s.skeleton_db.add(
+        camera=camera,
+        profile_vector=vec,
+        shoulder_ratio=props.shoulder_ratio,
+        torso_ratio=props.torso_ratio,
+        leg_ratio=props.leg_ratio,
+        arm_ratio=props.arm_ratio,
+        height_px=props.height_px,
+        subject=subject,
+    )
+    s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
+    return {
+        "id": row_id,
+        "subject": subject,
+        "shoulder": round(props.shoulder_ratio, 3),
+        "torso": round(props.torso_ratio, 3),
+        "leg": round(props.leg_ratio, 3),
+        "arm": round(props.arm_ratio, 3),
+        "height_px": round(props.height_px),
+    }
+
+
 @app.post("/api/backfill")
 async def backfill_old_events(
     s: Annotated[AppState, Depends(_get_state)],
@@ -1102,6 +1250,14 @@ _INLINE_HTML = """<!doctype html>
 <h1>Okända personer (kropp)</h1>
 <div class="known" id="known-bodies"></div>
 <div class="grid" id="grid-bodies"></div>
+
+<h2>Skeleton-validering (Protect-historik)</h2>
+<div class="known" id="known-skeletons"></div>
+<div style="margin-bottom:1rem">
+  <button onclick="loadProtectEvents()">Hämta person-events (7 dagar)</button>
+  <span id="event-status" style="color:#888;margin-left:0.5rem"></span>
+</div>
+<div class="grid" id="grid-events"></div>
 
 <h2>Okända ansikten</h2>
 <div class="known" id="known-faces"></div>
@@ -1261,12 +1417,68 @@ _INLINE_HTML = """<!doctype html>
     await loadTrajectories();
   }
 
+  async function loadProtectEvents() {
+    const status = document.getElementById('event-status');
+    status.textContent = 'Hämtar events...';
+    const r = await fetch('/api/protect/events?days=7&limit=200');
+    const events = await r.json();
+    const grid = document.getElementById('grid-events');
+    grid.innerHTML = '';
+    status.textContent = events.length + ' person-events';
+    for (const e of events) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.id = 'ev-' + e.id;
+      const ts = new Date(e.start).toLocaleString('sv-SE');
+      card.innerHTML = `
+        <img src="${e.thumbnail_url}" alt="event" loading="lazy">
+        <div class="meta">${e.camera} — ${ts}</div>
+        <div class="row">
+          <button onclick="labelEvent('${e.id}','${e.camera}','Malin')" style="background:#16a34a">Malin</button>
+          <button onclick="labelEvent('${e.id}','${e.camera}','Madde')" style="background:#2563eb">Madde</button>
+          <button onclick="labelEvent('${e.id}','${e.camera}','Loe')" style="background:#9333ea">Loe</button>
+        </div>
+        <div class="row">
+          <input type="text" placeholder="Annat namn" id="en-${e.id}">
+          <button onclick="labelEventCustom('${e.id}','${e.camera}')">Spara</button>
+          <button class="secondary" onclick="skipEvent('${e.id}')">Skippa</button>
+        </div>`;
+      grid.appendChild(card);
+    }
+  }
+  async function labelEvent(eventId, camera, name) {
+    const card = document.getElementById('ev-' + eventId);
+    card.style.opacity = '0.5';
+    const r = await fetch('/api/protect/events/' + eventId + '/analyze-skeleton', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: name, camera: camera}),
+    });
+    if (r.ok) {
+      const d = await r.json();
+      card.innerHTML = '<div class="meta" style="color:#4ade80">✓ ' + name + ' (h=' + d.height_px + 'px)</div>';
+      loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler');
+    } else {
+      const err = await r.json().catch(() => ({}));
+      card.innerHTML = '<div class="meta" style="color:#f87171">✗ ' + (err.detail || r.status) + '</div>';
+    }
+  }
+  async function labelEventCustom(eventId, camera) {
+    const name = document.getElementById('en-' + eventId).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    await labelEvent(eventId, camera, name);
+  }
+  function skipEvent(eventId) {
+    const card = document.getElementById('ev-' + eventId);
+    card.remove();
+  }
+
   async function refresh() {
     await Promise.all([
       loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
       loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
       loadKnown('/api/bodies/subjects', document.getElementById('known-bodies'), 'Tränade personer'),
       loadKnown('/api/trajectories/subjects', document.getElementById('known-trajectories'), 'Tränade rörelser'),
+      loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler'),
       loadFaces(),
       loadPets(),
       loadBodies(),
