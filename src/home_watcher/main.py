@@ -1755,9 +1755,13 @@ _INLINE_HTML = """<!doctype html>
           ${p.camera} — ${new Date(p.detected_at).toLocaleString('sv-SE')}
         </div>
         <div class="row">
-          <input type="text" placeholder="Namn" id="pn-${p.id}" list="pet-suggestions">
-          <button onclick="labelPet(${p.id})">Spara</button>
+          <button onclick="labelPetDirect(${p.id},'Churro')" style="background:#16a34a">Churro</button>
+          <button onclick="labelPetDirect(${p.id},'Semla')" style="background:#2563eb">Semla</button>
           <button class="secondary" onclick="discardPet(${p.id})">Skippa</button>
+        </div>
+        <div class="row">
+          <input type="text" placeholder="Annat namn" id="pn-${p.id}" list="pet-suggestions">
+          <button onclick="labelPet(${p.id})">Spara</button>
         </div>
         <details><summary>Full bild</summary><img src="${p.snapshot_url}" style="margin-top:0.5rem"></details>`;
       grid.appendChild(card);
@@ -1887,6 +1891,10 @@ _INLINE_HTML = """<!doctype html>
   async function labelPet(id) {
     const name = document.getElementById('pn-' + id).value.trim();
     if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/pets/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
+  }
+  async function labelPetDirect(id, name) {
     const r = await postLabel(`/api/pets/unknown/${id}/label`, id, name);
     if (r.ok) await refresh(); else alert('Fel: ' + r.status);
   }
