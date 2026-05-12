@@ -1620,6 +1620,13 @@ _INLINE_HTML = """<!doctype html>
 </head>
 <body>
 
+<datalist id="pet-suggestions">
+  <option value="Churro">
+  <option value="Semla">
+</datalist>
+<datalist id="person-suggestions"></datalist>
+<datalist id="vehicle-suggestions"></datalist>
+
 <div class="tabs">
   <div class="tab active" onclick="switchTab('label')">Att labela <span class="badge" id="queue-badge" style="display:none">0</span></div>
   <div class="tab" onclick="switchTab('admin')">Admin</div>
@@ -1721,7 +1728,7 @@ _INLINE_HTML = """<!doctype html>
         <img src="${f.crop_url}" alt="face">
         <div class="meta">${f.camera} — ${new Date(f.detected_at).toLocaleString('sv-SE')} — ${f.width_px}px</div>
         <div class="row">
-          <input type="text" placeholder="Namn" id="fn-${f.id}">
+          <input type="text" placeholder="Namn" id="fn-${f.id}" list="person-suggestions">
           <button onclick="labelFace(${f.id})">Spara</button>
           <button class="secondary" onclick="discardFace(${f.id})">Skippa</button>
         </div>
@@ -1748,7 +1755,7 @@ _INLINE_HTML = """<!doctype html>
           ${p.camera} — ${new Date(p.detected_at).toLocaleString('sv-SE')}
         </div>
         <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Semla)" id="pn-${p.id}">
+          <input type="text" placeholder="Namn" id="pn-${p.id}" list="pet-suggestions">
           <button onclick="labelPet(${p.id})">Spara</button>
           <button class="secondary" onclick="discardPet(${p.id})">Skippa</button>
         </div>
@@ -1775,7 +1782,7 @@ _INLINE_HTML = """<!doctype html>
           ${v.camera} — ${new Date(v.detected_at).toLocaleString('sv-SE')}
         </div>
         <div class="row">
-          <input type="text" placeholder="Namn (t.ex. Malins bil)" id="vn-${v.id}">
+          <input type="text" placeholder="Namn" id="vn-${v.id}" list="vehicle-suggestions">
           <button onclick="labelVehicle(${v.id})">Spara</button>
           <button class="secondary" onclick="discardVehicle(${v.id})">Skippa</button>
         </div>
@@ -1798,7 +1805,7 @@ _INLINE_HTML = """<!doctype html>
         <img src="${b.crop_url}" alt="body">
         <div class="meta">${b.camera} — ${new Date(b.detected_at).toLocaleString('sv-SE')} — ${b.width_px}x${b.height_px}px</div>
         <div class="row">
-          <input type="text" placeholder="Namn" id="bn-${b.id}">
+          <input type="text" placeholder="Namn" id="bn-${b.id}" list="person-suggestions">
           <button onclick="labelBody(${b.id})">Spara</button>
           <button class="secondary" onclick="discardBody(${b.id})">Skippa</button>
         </div>
@@ -1823,7 +1830,7 @@ _INLINE_HTML = """<!doctype html>
         <div class="meta">Riktning: ${dir} — Hastighet: ${t.speed} px/s</div>
         <div class="meta">In: zon ${t.entry_zone} — Ut: zon ${t.exit_zone}</div>
         <div class="row">
-          <input type="text" placeholder="Namn" id="tn-${t.id}">
+          <input type="text" placeholder="Namn" id="tn-${t.id}" list="person-suggestions">
           <button onclick="labelTraj(${t.id})">Spara</button>
           <button class="secondary" onclick="discardTraj(${t.id})">Skippa</button>
         </div>`;
@@ -1962,10 +1969,17 @@ _INLINE_HTML = """<!doctype html>
       card.remove();
       loadStats();
     } else {
-      card.style.opacity = '1';
       const err = await r.json().catch(() => ({}));
-      card.querySelector('.meta').insertAdjacentHTML('afterend',
-        '<div style="color:#f87171;font-size:0.85rem">Fel: ' + (err.detail || r.status) + '</div>');
+      const detail = err.detail || '';
+      if (detail.includes('keypoints') || detail.includes('proportions')) {
+        card.style.opacity = '0.3';
+        card.querySelector('.meta').insertAdjacentHTML('afterend',
+          '<div style="color:#888;font-size:0.85rem">Kunde inte analysera kroppen — for liten eller skymd. Skippas.</div>');
+      } else {
+        card.style.opacity = '1';
+        card.querySelector('.meta').insertAdjacentHTML('afterend',
+          '<div style="color:#f87171;font-size:0.85rem">Fel: ' + (detail || r.status) + '</div>');
+      }
     }
   }
   async function labelEventCustom(eventId, camera) {
@@ -2003,6 +2017,23 @@ _INLINE_HTML = """<!doctype html>
     setTimeout(() => { status.textContent = ''; }, 3000);
   }
 
+  async function updateSuggestions() {
+    const [faces, bodies, pets, vehicles] = await Promise.all([
+      fetch('/api/subjects').then(r => r.json()),
+      fetch('/api/bodies/subjects').then(r => r.json()),
+      fetch('/api/pets/subjects').then(r => r.json()),
+      fetch('/api/vehicles/subjects').then(r => r.json()),
+    ]);
+    const personNames = new Set([...Object.keys(faces), ...Object.keys(bodies)]);
+    const dl = document.getElementById('person-suggestions');
+    dl.innerHTML = [...personNames].map(n => `<option value="${n}">`).join('');
+    const vdl = document.getElementById('vehicle-suggestions');
+    vdl.innerHTML = Object.keys(vehicles).map(n => `<option value="${n}">`).join('');
+    const pdl = document.getElementById('pet-suggestions');
+    const petNames = new Set(['Churro', 'Semla', ...Object.keys(pets)]);
+    pdl.innerHTML = [...petNames].map(n => `<option value="${n}">`).join('');
+  }
+
   async function refresh() {
     await Promise.all([
       loadFaces(),
@@ -2011,6 +2042,7 @@ _INLINE_HTML = """<!doctype html>
       loadBodies(),
       loadTrajectories(),
       loadStats(),
+      updateSuggestions(),
     ]);
     updateQueueBadge();
   }
