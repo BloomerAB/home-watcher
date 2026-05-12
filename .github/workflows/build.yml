@@ -58,6 +58,8 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE_PREFIX }}/home-watcher:${{ steps.meta.outputs.tag }}
+          platforms: linux/amd64
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
