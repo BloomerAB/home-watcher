@@ -33,7 +33,7 @@ class ScoringContext:
     body_matches: list[str] = field(default_factory=list)
     body_person_count: int = 0
     family_members_home: list[str] = field(default_factory=list)
-    """Names of family members whose phones are on WiFi right now."""
+    trajectory_matches: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,20 +86,26 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
         ctx.body_person_count > 0 and len(ctx.body_matches) == ctx.body_person_count
     )
 
-    # If we have face matches with no unknowns OR all bodies matched (and no
-    # unknown face on top) → known family scenario, silent.
-    if (all_faces_known and not any_unknown_face) or (
-        all_bodies_matched and not any_unknown_face
-    ):
+    trajectory_matched = bool(ctx.trajectory_matches)
+
+    # If any strong signal identifies all persons as family → KNOWN_FAMILY.
+    recognized_by = (
+        (all_faces_known and not any_unknown_face)
+        or (all_bodies_matched and not any_unknown_face)
+        or (trajectory_matched and not any_unknown_face)
+    )
+    if recognized_by:
         subjects: list[str] = []
         if usable_faces:
             subjects.extend(f.matched_subject for f in usable_faces if f.matched_subject)
         subjects.extend(ctx.body_matches)
+        subjects.extend(ctx.trajectory_matches)
         unique_subjects = list(dict.fromkeys(subjects))
+        signal = "face" if all_faces_known else "body" if all_bodies_matched else "trajectory"
         return DecisionResult(
             decision=Decision.KNOWN_FAMILY,
             score=0.0,
-            reasons=[f"recognized: {', '.join(unique_subjects) or 'family'}"],
+            reasons=[f"recognized ({signal}): {', '.join(unique_subjects) or 'family'}"],
             matched_subjects=unique_subjects,
         )
 

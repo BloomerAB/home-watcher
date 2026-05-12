@@ -27,6 +27,9 @@ from .decision.scorer import (
 )
 from .bodies.db import BodyDB
 from .bodies.reid import BodyReID
+from .trajectory.db import TrajectoryDB
+from .trajectory.matcher import TrajectoryMatcher
+from .trajectory.tracker import BurstTracker
 from .faces.db import FaceDB
 from .faces.recognizer import FaceRecognizer, save_training_photo
 from .faces.unknown_db import UnknownFaceDB
@@ -51,6 +54,8 @@ class AppState:
     pet_detector: PetDetector
     body_db: BodyDB
     body_reid: BodyReID
+    trajectory_db: TrajectoryDB
+    trajectory_matcher: TrajectoryMatcher
     protect: ProtectClient
     presence: UnifiClientsLookup
     notifier: NtfyNotifier
@@ -141,11 +146,18 @@ async def _handle_event(update: ProtectUpdate) -> None:
         _save_unknown_faces(faces, snapshot, camera_name)
 
     # Body Re-ID: crop each person bbox, extract embedding, match against known.
-    # Save unknown bodies to queue for labeling.
     if person_bboxes:
         body_matches = _identify_bodies(person_bboxes, snapshot, camera_name, camera_id)
     if "animal" in sd_types:
         _detect_and_save_pets(snapshot, camera_name)
+
+    # Trajectory tracking: burst-capture 2 more snapshots and track positions.
+    import time as _time
+    trajectory_matches: list[str] = []
+    if person_bboxes and "person" in sd_types:
+        trajectory_matches = await _track_trajectory(
+            camera_id, camera_name, person_bboxes, _time.time(),
+        )
     family_members = await state.presence.family_members_at_home()
     family_home = len(family_members) > 0
     camera_cfg = state.cameras.get(camera_name, CameraConfig())
@@ -161,6 +173,7 @@ async def _handle_event(update: ProtectUpdate) -> None:
         body_matches=body_matches,
         body_person_count=len(person_bboxes),
         family_members_home=family_members,
+        trajectory_matches=trajectory_matches,
     )
     result = decide(
         ctx,
@@ -190,7 +203,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
         return
     state.last_alerted[camera_id] = now_ts
 
-    await _send_notification(result, camera_id, camera_name, sd_types, snapshot)
+    event_id = update.id if update.model_key == "event" else None
+    await _send_notification(result, camera_id, camera_name, sd_types, snapshot, event_id)
 
 
 async def _send_notification(
@@ -199,8 +213,12 @@ async def _send_notification(
     camera_name: str,
     sd_types: list[str],
     snapshot: bytes,
+    event_id: str | None = None,
 ) -> None:
-    click_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
+    if event_id:
+        click_url = f"https://{state.settings.unifi_host}/protect/events/{event_id}"
+    else:
+        click_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
 
     if result.decision == Decision.ALERT:
         await state.notifier.send(
@@ -298,6 +316,61 @@ def _identify_bodies(
             camera=camera,
             best_similarity=round(result.similarity, 3),
         )
+    return matches
+
+
+async def _track_trajectory(
+    camera_id: str,
+    camera_name: str,
+    initial_bboxes: list[tuple[tuple[int, int, int, int], float]],
+    t0: float,
+) -> list[str]:
+    """Take 2 more snapshots with ~2s delay, track person movement, match trajectory."""
+    tracker = BurstTracker(camera=camera_name)
+    tracker.add_frame(initial_bboxes, t0)
+
+    for i in range(1, 3):
+        await asyncio.sleep(2.0)
+        snap = await state.protect.fetch_snapshot(camera_id)
+        if snap is None:
+            continue
+        try:
+            bboxes = state.pet_detector.detect_person_bboxes(snap)
+        except Exception:  # noqa: BLE001
+            continue
+        tracker.add_frame(bboxes, t0 + i * 2.0)
+
+    trajectories = tracker.get_trajectories()
+    if not trajectories:
+        return []
+
+    matches: list[str] = []
+    for traj in trajectories:
+        if traj.is_stationary:
+            continue
+        result = state.trajectory_matcher.match(traj)
+        if result.is_known:
+            log.info(
+                "trajectory_matched",
+                camera=camera_name,
+                subject=result.matched_subject,
+                similarity=round(result.similarity, 3),
+                direction=round(traj.direction_angle or 0, 1),
+                speed=round(traj.speed_px_per_sec, 1),
+            )
+            assert result.matched_subject is not None
+            matches.append(result.matched_subject)
+        else:
+            state.trajectory_db.add(traj)
+            log.info(
+                "trajectory_unknown_saved",
+                camera=camera_name,
+                best_similarity=round(result.similarity, 3),
+                direction=round(traj.direction_angle or 0, 1),
+                speed=round(traj.speed_px_per_sec, 1),
+                entry=traj.entry_zone,
+                exit=traj.exit_zone,
+            )
     return matches
 
 
@@ -408,6 +481,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.body_db = BodyDB(settings.data_dir / "bodies.db")
     state.body_reid = BodyReID(similarity_threshold=settings.body_similarity_threshold)
     state.body_reid.reload(state.body_db.all_known_by_subject())
+    state.trajectory_db = TrajectoryDB(settings.data_dir / "trajectories.db")
+    state.trajectory_matcher = TrajectoryMatcher()
+    state.trajectory_matcher.reload(state.trajectory_db.known_by_camera())
     state.protect = ProtectClient(
         host=settings.unifi_host,
         username=settings.unifi_user,
@@ -740,6 +816,64 @@ async def discard_unknown_body(
     return {"status": "discarded"}
 
 
+@app.get("/api/trajectories/unknown")
+async def list_unknown_trajectories(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 50
+) -> list[dict[str, object]]:
+    rows = s.trajectory_db.list_unknown(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at,
+            "camera": r.camera,
+            "direction_angle": r.direction_angle,
+            "speed": round(r.speed, 1),
+            "entry_zone": r.entry_zone,
+            "exit_zone": r.exit_zone,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/trajectories/subjects")
+async def list_trajectory_subjects(
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, int]:
+    known = s.trajectory_db.known_by_camera()
+    counts: dict[str, int] = {}
+    for cam_subjects in known.values():
+        for subject, vectors in cam_subjects.items():
+            counts[subject] = counts.get(subject, 0) + len(vectors)
+    return counts
+
+
+@app.post("/api/trajectories/unknown/{traj_id}/label")
+async def label_unknown_trajectory(
+    traj_id: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.trajectory_db.get(traj_id)
+    if not row:
+        raise HTTPException(status_code=404)
+    s.trajectory_db.label(traj_id, subject)
+    s.trajectory_matcher.reload(s.trajectory_db.known_by_camera())
+    return {"id": traj_id, "subject": subject}
+
+
+@app.delete("/api/trajectories/unknown/{traj_id}")
+async def discard_unknown_trajectory(
+    traj_id: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.trajectory_db.get(traj_id) is None:
+        raise HTTPException(status_code=404)
+    s.trajectory_db.discard(traj_id)
+    return {"status": "discarded"}
+
+
 @app.post("/api/backfill")
 async def backfill_old_events(
     s: Annotated[AppState, Depends(_get_state)],
@@ -888,6 +1022,10 @@ _INLINE_HTML = """<!doctype html>
 <div class="known" id="known-faces"></div>
 <div class="grid" id="grid-faces"></div>
 
+<h2>Rörelsemönster</h2>
+<div class="known" id="known-trajectories"></div>
+<div class="grid" id="grid-trajectories"></div>
+
 <h2>Okända djur</h2>
 <div class="known" id="known-pets"></div>
 <div class="grid" id="grid-pets"></div>
@@ -1006,14 +1144,48 @@ _INLINE_HTML = """<!doctype html>
     await loadBodies();
   }
 
+  async function loadTrajectories() {
+    const r = await fetch('/api/trajectories/unknown');
+    const items = await r.json();
+    const grid = document.getElementById('grid-trajectories');
+    grid.innerHTML = items.length === 0 ? '<p>Inga okända rörelser i kön.</p>' : '';
+    for (const t of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const dir = t.direction_angle !== null ? Math.round(t.direction_angle) + '°' : 'stillastående';
+      card.innerHTML = `
+        <div class="meta">${t.camera} — ${new Date(t.detected_at).toLocaleString('sv-SE')}</div>
+        <div class="meta">Riktning: ${dir} — Hastighet: ${t.speed} px/s</div>
+        <div class="meta">In: zon ${t.entry_zone} — Ut: zon ${t.exit_zone}</div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Malin)" id="tn-${t.id}">
+          <button onclick="labelTraj(${t.id})">Spara</button>
+        </div>
+        <div class="row"><button class="secondary" onclick="discardTraj(${t.id})">Skippa</button></div>`;
+      grid.appendChild(card);
+    }
+  }
+  async function labelTraj(id) {
+    const name = document.getElementById('tn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/trajectories/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
+  }
+  async function discardTraj(id) {
+    await fetch(`/api/trajectories/unknown/${id}`, {method: 'DELETE'});
+    await loadTrajectories();
+  }
+
   async function refresh() {
     await Promise.all([
       loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
       loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
       loadKnown('/api/bodies/subjects', document.getElementById('known-bodies'), 'Tränade personer'),
+      loadKnown('/api/trajectories/subjects', document.getElementById('known-trajectories'), 'Tränade rörelser'),
       loadFaces(),
       loadPets(),
       loadBodies(),
+      loadTrajectories(),
     ]);
   }
   refresh();
