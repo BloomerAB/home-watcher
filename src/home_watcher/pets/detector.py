@@ -38,7 +38,7 @@ class DetectedPet:
 
 
 class PetDetector:
-    def __init__(self, model_name: str = "yolov8n.pt", min_confidence: float = 0.35) -> None:
+    def __init__(self, model_name: str = "yolov8n.pt", min_confidence: float = 0.50) -> None:
         self.model_name = model_name
         self.min_confidence = min_confidence
         self._model = None
