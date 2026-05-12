@@ -23,16 +23,9 @@ COPY src/ ./src/
 
 RUN pip install --upgrade pip wheel
 
-ARG TARGETARCH
-# On amd64: use CPU-only index to avoid pulling CUDA wheels (~2GB heavier)
-# On arm64: standard PyPI torch is already CPU-only
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      pip install --prefix=/install \
-        --index-url https://download.pytorch.org/whl/cpu \
-        torch torchvision; \
-    else \
-      pip install --prefix=/install torch torchvision; \
-    fi
+RUN pip install --prefix=/install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch torchvision
 
 RUN PYTHONPATH=/install/lib/python3.13/site-packages \
     pip install --prefix=/install .
