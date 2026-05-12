@@ -257,3 +257,43 @@ def test_presence_count_blocked_by_unknown_face() -> None:
         min_face_width_px=60,
     )
     assert result.decision != Decision.KNOWN_FAMILY
+
+
+def test_known_vehicle_on_entrance_silent() -> None:
+    """Known family car on always-alert camera → KNOWN_FAMILY, not ALERT."""
+    cfg = CameraConfig(always_alert_objects=["vehicle"])
+    ctx = _ctx(smart_detect_types=["vehicle"], camera_cfg=cfg)
+    ctx.vehicle_matches = ["Malins bil"]
+    ctx.vehicle_count = 1
+    result = decide(ctx, alert_threshold=0.6, min_face_width_px=60)
+    assert result.decision == Decision.KNOWN_FAMILY
+    assert "Malins bil" in result.matched_subjects
+
+
+def test_unknown_vehicle_on_entrance_alerts() -> None:
+    """Unknown vehicle on always-alert camera → ALERT."""
+    cfg = CameraConfig(always_alert_objects=["vehicle"])
+    ctx = _ctx(smart_detect_types=["vehicle"], camera_cfg=cfg)
+    ctx.vehicle_matches = []
+    ctx.vehicle_count = 1
+    result = decide(ctx, alert_threshold=0.6, min_face_width_px=60)
+    assert result.decision == Decision.ALERT
+
+
+def test_mixed_vehicles_on_entrance_alerts() -> None:
+    """One known + one unknown vehicle on always-alert camera → ALERT."""
+    cfg = CameraConfig(always_alert_objects=["vehicle"])
+    ctx = _ctx(smart_detect_types=["vehicle"], camera_cfg=cfg)
+    ctx.vehicle_matches = ["Malins bil"]
+    ctx.vehicle_count = 2
+    result = decide(ctx, alert_threshold=0.6, min_face_width_px=60)
+    assert result.decision == Decision.ALERT
+
+
+def test_known_vehicle_on_other_camera_known_family() -> None:
+    """Known vehicle on non-driveway camera → KNOWN_FAMILY."""
+    ctx = _ctx(smart_detect_types=["vehicle"], camera_cfg=CameraConfig())
+    ctx.vehicle_matches = ["Malins bil"]
+    ctx.vehicle_count = 1
+    result = decide(ctx, alert_threshold=0.6, min_face_width_px=60)
+    assert result.decision == Decision.KNOWN_FAMILY

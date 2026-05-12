@@ -39,6 +39,8 @@ from .faces.unknown_db import UnknownFaceDB
 from .pets.db import PetDB
 from .pets.detector import PetDetector
 from .pets.reid import PetReID
+from .vehicles.db import VehicleDB
+from .vehicles.reid import VehicleReID
 from .notifier.ntfy import NtfyNotifier
 from .presence.unifi_clients import UnifiClientsLookup
 from .protect.client import ProtectClient
@@ -57,6 +59,8 @@ class AppState:
     pet_db: PetDB
     pet_detector: PetDetector
     pet_reid: PetReID
+    vehicle_db: VehicleDB
+    vehicle_reid: VehicleReID
     body_db: BodyDB
     body_reid: BodyReID
     trajectory_db: TrajectoryDB
@@ -160,6 +164,12 @@ async def _handle_event(update: ProtectUpdate) -> None:
     matched_pets: list[str] = []
     if "animal" in sd_types:
         matched_pets = _detect_and_save_pets(snapshot, camera_name)
+    matched_vehicles: list[str] = []
+    vehicle_count = 0
+    if "vehicle" in sd_types:
+        matched_vehicles, vehicle_count = _detect_and_save_vehicles(
+            snapshot, camera_name, camera_id,
+        )
 
     # Trajectory tracking: burst-capture 2 more snapshots and track positions.
     import time as _time
@@ -189,6 +199,8 @@ async def _handle_event(update: ProtectUpdate) -> None:
         family_members_home=family_members,
         trajectory_matches=trajectory_matches,
         skeleton_matches=skeleton_matches,
+        vehicle_matches=matched_vehicles,
+        vehicle_count=vehicle_count,
     )
     result = decide(
         ctx,
@@ -234,7 +246,10 @@ async def _handle_event(update: ProtectUpdate) -> None:
     state.last_alerted[camera_id] = now_ts
 
     event_id = update.id if update.model_key == "event" else None
-    await _send_notification(result, camera_id, camera_name, sd_types, snapshot, event_id, matched_pets)
+    await _send_notification(
+        result, camera_id, camera_name, sd_types, snapshot, event_id,
+        matched_pets, matched_vehicles,
+    )
 
 
 async def _send_notification(
@@ -245,6 +260,7 @@ async def _send_notification(
     snapshot: bytes,
     event_id: str | None = None,
     matched_pets: list[str] | None = None,
+    matched_vehicles: list[str] | None = None,
 ) -> None:
     if event_id:
         click_url = f"https://{state.settings.unifi_host}/protect/events/{event_id}"
@@ -252,11 +268,17 @@ async def _send_notification(
         click_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
 
     if result.decision == Decision.ALERT:
+        is_vehicle_alert = "vehicle" in sd_types and not matched_vehicles
+        title = (
+            f"Okänt fordon vid {camera_name}"
+            if is_vehicle_alert
+            else f"Okänd rörelse vid {camera_name}"
+        )
         await state.notifier.send(
-            title=f"Okänd rörelse vid {camera_name}",
+            title=title,
             message=f"Score: {result.score:.2f}\n" + "\n".join(result.reasons),
             priority=4,
-            tags=["warning", "house"],
+            tags=["warning", "car" if is_vehicle_alert else "house"],
             image_bytes=snapshot,
             click_url=click_url,
         )
@@ -511,6 +533,69 @@ def _detect_and_save_pets(snapshot: bytes, camera: str) -> list[str]:
     return matched_names
 
 
+def _detect_and_save_vehicles(
+    snapshot: bytes, camera: str, camera_id: str,
+) -> tuple[list[str], int]:
+    """Run YOLO on snapshot for vehicles, match against known, save unknowns.
+
+    Returns (matched_names, total_vehicle_count).
+    """
+    from datetime import UTC, datetime
+
+    try:
+        vehicles = state.pet_detector.detect_vehicles(snapshot)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vehicle_detect_failed", error=str(exc), camera=camera)
+        return [], 0
+    if not vehicles:
+        return [], 0
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+    vehicle_dir = state.settings.data_dir / "unknown_vehicles"
+    vehicle_dir.mkdir(parents=True, exist_ok=True)
+    matched_names: list[str] = []
+
+    for idx, v in enumerate(vehicles):
+        crop_bytes = PetDetector.crop(snapshot, v.bbox)
+        embedding = state.vehicle_reid.embed(crop_bytes)
+        match = state.vehicle_reid.match(embedding)
+
+        if match.is_known:
+            log.info(
+                "vehicle_matched",
+                camera=camera,
+                subject=match.matched_subject,
+                vehicle_class=v.species,
+                similarity=round(match.similarity, 3),
+            )
+            matched_names.append(match.matched_subject or v.species)
+            continue
+
+        crop_filename = f"{timestamp}_{camera}_{v.species}_{idx}_crop.jpg"
+        snap_filename = f"{timestamp}_{camera}_{v.species}_{idx}_snap.jpg"
+        (vehicle_dir / crop_filename).write_bytes(crop_bytes)
+        (vehicle_dir / snap_filename).write_bytes(snapshot)
+        state.vehicle_db.add_unknown(
+            camera=camera,
+            vehicle_class=v.species,
+            confidence=v.confidence,
+            crop_filename=crop_filename,
+            snapshot_filename=snap_filename,
+            bbox=v.bbox,
+            width_px=v.width_px,
+            height_px=v.height_px,
+        )
+        log.info(
+            "vehicle_unknown",
+            camera=camera,
+            vehicle_class=v.species,
+            confidence=round(v.confidence, 2),
+            best_similarity=round(match.similarity, 3),
+        )
+
+    return matched_names, len(vehicles)
+
+
 def _save_unknown_faces(faces: list, snapshot: bytes, camera: str) -> None:
     """Save crop + metadata for any face that's unknown or too uncertain."""
     from datetime import UTC, datetime
@@ -581,6 +666,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.pet_reid = PetReID()
     pet_known = state.pet_db.all_known_by_subject()
     state.pet_reid.reload(pet_known, state.pet_db.species_by_subject())
+    state.vehicle_db = VehicleDB(settings.data_dir / "vehicles.db")
+    state.vehicle_reid = VehicleReID()
+    vehicle_known = state.vehicle_db.all_known_by_subject()
+    state.vehicle_reid.reload(vehicle_known)
     state.body_db = BodyDB(settings.data_dir / "bodies.db")
     state.body_reid = BodyReID(similarity_threshold=settings.body_similarity_threshold)
     body_known = state.body_db.all_known_by_subject()
@@ -603,6 +692,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         skeleton_profiles=sum(len(v) for v in skel_known.values()),
         pet_subjects=list(pet_known.keys()),
         pet_embeddings=sum(len(v) for v in pet_known.values()),
+        vehicle_subjects=list(vehicle_known.keys()),
+        vehicle_embeddings=sum(len(v) for v in vehicle_known.values()),
     )
     state.protect = ProtectClient(
         host=settings.unifi_host,
@@ -686,11 +777,13 @@ async def reload_all(s: Annotated[AppState, Depends(_get_state)]) -> dict:
     s.trajectory_matcher.reload(s.trajectory_db.known_by_camera())
     s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
     s.pet_reid.reload(s.pet_db.all_known_by_subject(), s.pet_db.species_by_subject())
+    s.vehicle_reid.reload(s.vehicle_db.all_known_by_subject())
     return {
         "face_subjects": s.recognizer.known_subjects(),
         "body_subjects": list(s.body_db.all_known_by_subject().keys()),
         "skeleton_subjects": list(s.skeleton_db.known_by_subject().keys()),
         "pet_subjects": list(s.pet_db.all_known_by_subject().keys()),
+        "vehicle_subjects": list(s.vehicle_db.all_known_by_subject().keys()),
     }
 
 
@@ -870,6 +963,89 @@ async def discard_unknown_pet(
     if s.pet_db.get_unknown(pet_id) is None:
         raise HTTPException(status_code=404)
     s.pet_db.mark_discarded(pet_id)
+    return {"status": "discarded"}
+
+
+@app.get("/api/vehicles/subjects")
+async def list_vehicle_subjects(s: Annotated[AppState, Depends(_get_state)]) -> dict[str, int]:
+    return s.vehicle_db.list_known_subjects()
+
+
+@app.get("/api/vehicles/unknown")
+async def list_unknown_vehicles(
+    s: Annotated[AppState, Depends(_get_state)], limit: int = 100
+) -> list[dict[str, object]]:
+    rows = s.vehicle_db.list_unlabeled(limit=limit)
+    return [
+        {
+            "id": r.id,
+            "detected_at": r.detected_at.isoformat(),
+            "camera": r.camera,
+            "vehicle_class": r.vehicle_class,
+            "confidence": round(r.confidence, 2),
+            "width_px": r.width_px,
+            "height_px": r.height_px,
+            "crop_url": f"/api/vehicles/unknown/{r.id}/crop",
+            "snapshot_url": f"/api/vehicles/unknown/{r.id}/snapshot",
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/vehicles/unknown/{vid}/crop")
+async def get_unknown_vehicle_crop(
+    vid: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.vehicle_db.get_unknown(vid)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_vehicles" / row.crop_filename)
+
+
+@app.get("/api/vehicles/unknown/{vid}/snapshot")
+async def get_unknown_vehicle_snapshot(
+    vid: int, s: Annotated[AppState, Depends(_get_state)]
+):
+    from fastapi.responses import FileResponse
+
+    row = s.vehicle_db.get_unknown(vid)
+    if not row:
+        raise HTTPException(status_code=404)
+    return FileResponse(s.settings.data_dir / "unknown_vehicles" / row.snapshot_filename)
+
+
+@app.post("/api/vehicles/unknown/{vid}/label")
+async def label_unknown_vehicle(
+    vid: int,
+    body: dict[str, str],
+    s: Annotated[AppState, Depends(_get_state)],
+) -> dict[str, str | int]:
+    subject = body.get("subject", "").strip()
+    if not subject:
+        raise HTTPException(status_code=400, detail="subject is required")
+    row = s.vehicle_db.get_unknown(vid)
+    if not row:
+        raise HTTPException(status_code=404)
+    crop_src = s.settings.data_dir / "unknown_vehicles" / row.crop_filename
+    embedding = None
+    if crop_src.exists():
+        crop_bytes = crop_src.read_bytes()
+        embedding = s.vehicle_reid.embed(crop_bytes)
+    db_id = s.vehicle_db.add_known(subject, row.vehicle_class, row.crop_filename, embedding)
+    s.vehicle_db.mark_labeled(vid)
+    s.vehicle_reid.reload(s.vehicle_db.all_known_by_subject())
+    return {"known_id": db_id, "subject": subject, "vehicle_class": row.vehicle_class}
+
+
+@app.delete("/api/vehicles/unknown/{vid}")
+async def discard_unknown_vehicle(
+    vid: int, s: Annotated[AppState, Depends(_get_state)]
+) -> dict[str, str]:
+    if s.vehicle_db.get_unknown(vid) is None:
+        raise HTTPException(status_code=404)
+    s.vehicle_db.mark_discarded(vid)
     return {"status": "discarded"}
 
 
@@ -1223,6 +1399,73 @@ async def backfill_pets(
     return {"events_scanned": scanned, "pets_found": found}
 
 
+@app.post("/api/vehicles/backfill")
+async def backfill_vehicles(
+    s: Annotated[AppState, Depends(_get_state)],
+    days: int = 30,
+    limit: int = 500,
+) -> dict[str, int]:
+    """Scan Protect vehicle events with YOLO to build training data."""
+    import time as _time
+    from datetime import UTC, datetime
+
+    now_ms = int(_time.time() * 1000)
+    start_ms = now_ms - days * 24 * 3600 * 1000
+    events = await s.protect.list_events(
+        start_ms, now_ms, types=["smartDetectZone"], limit=limit,
+    )
+    vehicle_events = [
+        e for e in events if "vehicle" in e.get("smartDetectTypes", [])
+    ]
+    log.info("vehicle_backfill_started", days=days, events=len(vehicle_events))
+
+    vehicle_dir = s.settings.data_dir / "unknown_vehicles"
+    vehicle_dir.mkdir(parents=True, exist_ok=True)
+    found = 0
+    scanned = 0
+
+    for ev in vehicle_events:
+        event_id = ev.get("id")
+        camera_id = ev.get("camera", "")
+        if not event_id:
+            continue
+        thumb = await s.protect.fetch_event_thumbnail(event_id)
+        if thumb is None or len(thumb) < 1000:
+            continue
+        scanned += 1
+        try:
+            vehicles = s.pet_detector.detect_vehicles(thumb)
+        except Exception:  # noqa: BLE001
+            continue
+        if not vehicles:
+            continue
+
+        camera_name = s.protect.camera_name(camera_id)
+        ts = datetime.fromtimestamp(ev.get("start", now_ms) / 1000, UTC)
+        timestamp = ts.strftime("%Y%m%dT%H%M%S")
+
+        for idx, v in enumerate(vehicles):
+            crop_bytes = PetDetector.crop(thumb, v.bbox)
+            crop_filename = f"backfill_{timestamp}_{camera_name}_{v.species}_{idx}_crop.jpg"
+            snap_filename = f"backfill_{timestamp}_{camera_name}_{v.species}_{idx}_snap.jpg"
+            (vehicle_dir / crop_filename).write_bytes(crop_bytes)
+            (vehicle_dir / snap_filename).write_bytes(thumb)
+            s.vehicle_db.add_unknown(
+                camera=camera_name,
+                vehicle_class=v.species,
+                confidence=v.confidence,
+                crop_filename=crop_filename,
+                snapshot_filename=snap_filename,
+                bbox=v.bbox,
+                width_px=v.width_px,
+                height_px=v.height_px,
+            )
+            found += 1
+
+    log.info("vehicle_backfill_done", scanned=scanned, found=found)
+    return {"events_scanned": scanned, "vehicles_found": found}
+
+
 @app.post("/api/backfill")
 async def backfill_old_events(
     s: Annotated[AppState, Depends(_get_state)],
@@ -1390,6 +1633,14 @@ _INLINE_HTML = """<!doctype html>
   <span id="pet-backfill-status" style="color:#888;margin-left:0.5rem"></span>
 </div>
 <div class="grid" id="grid-pets"></div>
+
+<h2>Okända fordon</h2>
+<div class="known" id="known-vehicles"></div>
+<div style="margin-bottom:1rem">
+  <button onclick="backfillVehicles()">Sök fordon i historik (30 dagar)</button>
+  <span id="vehicle-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+</div>
+<div class="grid" id="grid-vehicles"></div>
 
 <script>
   async function loadKnown(url, target, prefix) {
@@ -1602,15 +1853,60 @@ _INLINE_HTML = """<!doctype html>
     await loadPets();
   }
 
+  async function loadVehicles() {
+    const r = await fetch('/api/vehicles/unknown');
+    const items = await r.json();
+    const grid = document.getElementById('grid-vehicles');
+    grid.innerHTML = items.length === 0 ? '<p>Inga okända fordon i kön.</p>' : '';
+    for (const v of items) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML = `
+        <img src="${v.crop_url}" alt="vehicle">
+        <div class="meta">
+          <span class="tag">${v.vehicle_class}</span>
+          <span class="tag">${Math.round(v.confidence*100)}%</span>
+          ${v.camera} — ${new Date(v.detected_at).toLocaleString('sv-SE')}
+        </div>
+        <div class="row">
+          <input type="text" placeholder="Namn (t.ex. Malins bil)" id="vn-${v.id}">
+          <button onclick="labelVehicle(${v.id})">Spara</button>
+        </div>
+        <div class="row"><button class="secondary" onclick="discardVehicle(${v.id})">Skippa</button></div>
+        <details><summary>Full bild</summary><img src="${v.snapshot_url}" style="margin-top:0.5rem"></details>`;
+      grid.appendChild(card);
+    }
+  }
+  async function labelVehicle(id) {
+    const name = document.getElementById('vn-' + id).value.trim();
+    if (!name) { alert('Ange namn'); return; }
+    const r = await postLabel(`/api/vehicles/unknown/${id}/label`, id, name);
+    if (r.ok) await refresh(); else alert('Fel: ' + r.status);
+  }
+  async function discardVehicle(id) {
+    await fetch(`/api/vehicles/unknown/${id}`, {method: 'DELETE'});
+    await loadVehicles();
+  }
+  async function backfillVehicles() {
+    const status = document.getElementById('vehicle-backfill-status');
+    status.textContent = 'Söker fordon i gamla events...';
+    const r = await fetch('/api/vehicles/backfill?days=30&limit=500', {method: 'POST'});
+    const d = await r.json();
+    status.textContent = `Klart: ${d.vehicles_found} fordon hittade i ${d.events_scanned} events`;
+    await loadVehicles();
+  }
+
   async function refresh() {
     await Promise.all([
       loadKnown('/api/subjects', document.getElementById('known-faces'), 'Tränade ansikten'),
       loadKnown('/api/pets/subjects', document.getElementById('known-pets'), 'Tränade djur'),
+      loadKnown('/api/vehicles/subjects', document.getElementById('known-vehicles'), 'Tränade fordon'),
       loadKnown('/api/bodies/subjects', document.getElementById('known-bodies'), 'Tränade personer'),
       loadKnown('/api/trajectories/subjects', document.getElementById('known-trajectories'), 'Tränade rörelser'),
       loadKnown('/api/skeletons/known', document.getElementById('known-skeletons'), 'Skeleton-profiler'),
       loadFaces(),
       loadPets(),
+      loadVehicles(),
       loadBodies(),
       loadTrajectories(),
     ]);

@@ -20,6 +20,8 @@ PET_CLASSES = {
     "elephant", "bear", "zebra", "giraffe",
 }
 
+VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
+
 PERSON_CLASS = "person"
 
 
@@ -87,6 +89,20 @@ class PetDetector:
             )
             for name, conf, bbox in self._run(image_bytes)
             if name in PET_CLASSES
+        ]
+
+    def detect_vehicles(self, image_bytes: bytes) -> list[DetectedPet]:
+        """Detect vehicles (car, truck, bus, motorcycle)."""
+        return [
+            DetectedPet(
+                species=name,
+                confidence=conf,
+                bbox=bbox,
+                width_px=bbox[1] - bbox[3],
+                height_px=bbox[2] - bbox[0],
+            )
+            for name, conf, bbox in self._run(image_bytes)
+            if name in VEHICLE_CLASSES
         ]
 
     def detect_persons(self, image_bytes: bytes) -> int:

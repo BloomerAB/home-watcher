@@ -35,6 +35,8 @@ class ScoringContext:
     family_members_home: list[str] = field(default_factory=list)
     trajectory_matches: list[str] = field(default_factory=list)
     skeleton_matches: list[str] = field(default_factory=list)
+    vehicle_matches: list[str] = field(default_factory=list)
+    vehicle_count: int = 0
 
 
 @dataclass
@@ -54,6 +56,13 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
     # 1. Per-camera always-alert rules (short-circuit)
     for obj in ctx.smart_detect_types:
         if obj in ctx.camera_cfg.always_alert_objects:
+            if obj == "vehicle" and ctx.vehicle_count > 0 and len(ctx.vehicle_matches) == ctx.vehicle_count:
+                return DecisionResult(
+                    decision=Decision.KNOWN_FAMILY,
+                    score=0.0,
+                    reasons=[f"known vehicle: {', '.join(ctx.vehicle_matches)}"],
+                    matched_subjects=ctx.vehicle_matches,
+                )
             return DecisionResult(
                 decision=Decision.ALERT,
                 score=1.0,
@@ -69,6 +78,13 @@ def decide(ctx: ScoringContext, *, alert_threshold: float, min_face_width_px: in
                 reasons=["animal detected, no person"],
             )
         if "vehicle" in ctx.smart_detect_types:
+            if ctx.vehicle_matches:
+                return DecisionResult(
+                    decision=Decision.KNOWN_FAMILY,
+                    score=0.0,
+                    reasons=[f"known vehicle: {', '.join(ctx.vehicle_matches)}"],
+                    matched_subjects=ctx.vehicle_matches,
+                )
             return DecisionResult(
                 decision=Decision.IGNORE,
                 score=0.0,
