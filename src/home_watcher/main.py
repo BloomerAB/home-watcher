@@ -543,14 +543,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.pet_detector = PetDetector()
     state.body_db = BodyDB(settings.data_dir / "bodies.db")
     state.body_reid = BodyReID(similarity_threshold=settings.body_similarity_threshold)
-    state.body_reid.reload(state.body_db.all_known_by_subject())
+    body_known = state.body_db.all_known_by_subject()
+    state.body_reid.reload(body_known)
     state.trajectory_db = TrajectoryDB(settings.data_dir / "trajectories.db")
     state.trajectory_matcher = TrajectoryMatcher()
-    state.trajectory_matcher.reload(state.trajectory_db.known_by_camera())
+    traj_known = state.trajectory_db.known_by_camera()
+    state.trajectory_matcher.reload(traj_known)
     state.skeleton_analyzer = SkeletonAnalyzer()
     state.skeleton_db = SkeletonDB(settings.data_dir / "skeletons.db")
     state.skeleton_matcher = SkeletonMatcher()
-    state.skeleton_matcher.reload(state.skeleton_db.known_by_subject())
+    skel_known = state.skeleton_db.known_by_subject()
+    state.skeleton_matcher.reload(skel_known)
+    log.info(
+        "models_loaded",
+        body_subjects=list(body_known.keys()),
+        body_embeddings=sum(len(v) for v in body_known.values()),
+        trajectory_cameras=list(traj_known.keys()),
+        skeleton_subjects=list(skel_known.keys()),
+        skeleton_profiles=sum(len(v) for v in skel_known.values()),
+    )
     state.protect = ProtectClient(
         host=settings.unifi_host,
         username=settings.unifi_user,
@@ -627,9 +638,16 @@ async def delete_subject(
 
 
 @app.post("/api/reload")
-async def reload_faces(s: Annotated[AppState, Depends(_get_state)]) -> dict[str, list[str]]:
+async def reload_all(s: Annotated[AppState, Depends(_get_state)]) -> dict:
     s.recognizer.reload()
-    return {"subjects": s.recognizer.known_subjects()}
+    s.body_reid.reload(s.body_db.all_known_by_subject())
+    s.trajectory_matcher.reload(s.trajectory_db.known_by_camera())
+    s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
+    return {
+        "face_subjects": s.recognizer.known_subjects(),
+        "body_subjects": list(s.body_db.all_known_by_subject().keys()),
+        "skeleton_subjects": list(s.skeleton_db.known_by_subject().keys()),
+    }
 
 
 @app.post("/api/test-recognize")
