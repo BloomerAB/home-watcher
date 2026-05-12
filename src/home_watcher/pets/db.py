@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
+
 
 class UnknownPetRow(NamedTuple):
     id: int
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS known_pets (
     subject TEXT NOT NULL,
     species TEXT NOT NULL,
     crop_filename TEXT NOT NULL,
+    embedding BLOB,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_known_pets_subject ON known_pets(subject);
@@ -130,13 +133,20 @@ class PetDB:
 
     # --- known pets ---
 
-    def add_known(self, subject: str, species: str, crop_filename: str) -> int:
+    def add_known(
+        self,
+        subject: str,
+        species: str,
+        crop_filename: str,
+        embedding: np.ndarray | None = None,
+    ) -> int:
         now = datetime.now(UTC).isoformat()
+        emb_bytes = embedding.tobytes() if embedding is not None else None
         with self._conn() as conn:
             cur = conn.execute(
-                """INSERT INTO known_pets (subject, species, crop_filename, created_at)
-                VALUES (?, ?, ?, ?)""",
-                (subject, species, crop_filename, now),
+                """INSERT INTO known_pets (subject, species, crop_filename, embedding, created_at)
+                VALUES (?, ?, ?, ?, ?)""",
+                (subject, species, crop_filename, emb_bytes, now),
             )
             return cur.lastrowid or 0
 
@@ -146,6 +156,24 @@ class PetDB:
                 "SELECT subject, COUNT(*) AS n FROM known_pets GROUP BY subject"
             ).fetchall()
         return {r["subject"]: r["n"] for r in rows}
+
+    def all_known_by_subject(self) -> dict[str, list[np.ndarray]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT subject, embedding FROM known_pets WHERE embedding IS NOT NULL"
+            ).fetchall()
+        result: dict[str, list[np.ndarray]] = {}
+        for r in rows:
+            emb = np.frombuffer(r["embedding"], dtype=np.float32).copy()
+            result.setdefault(r["subject"], []).append(emb)
+        return result
+
+    def species_by_subject(self) -> dict[str, str]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT subject, species FROM known_pets"
+            ).fetchall()
+        return {r["subject"]: r["species"] for r in rows}
 
     def delete_known_subject(self, subject: str) -> int:
         with self._conn() as conn:

@@ -38,6 +38,7 @@ from .faces.recognizer import FaceRecognizer, save_training_photo
 from .faces.unknown_db import UnknownFaceDB
 from .pets.db import PetDB
 from .pets.detector import PetDetector
+from .pets.reid import PetReID
 from .notifier.ntfy import NtfyNotifier
 from .presence.unifi_clients import UnifiClientsLookup
 from .protect.client import ProtectClient
@@ -55,6 +56,7 @@ class AppState:
     recognizer: FaceRecognizer
     pet_db: PetDB
     pet_detector: PetDetector
+    pet_reid: PetReID
     body_db: BodyDB
     body_reid: BodyReID
     trajectory_db: TrajectoryDB
@@ -155,8 +157,9 @@ async def _handle_event(update: ProtectUpdate) -> None:
     # Body Re-ID: crop each person bbox, extract embedding, match against known.
     if person_bboxes:
         body_matches = _identify_bodies(person_bboxes, snapshot, camera_name, camera_id)
+    matched_pets: list[str] = []
     if "animal" in sd_types:
-        _detect_and_save_pets(snapshot, camera_name)
+        matched_pets = _detect_and_save_pets(snapshot, camera_name)
 
     # Trajectory tracking: burst-capture 2 more snapshots and track positions.
     import time as _time
@@ -231,7 +234,7 @@ async def _handle_event(update: ProtectUpdate) -> None:
     state.last_alerted[camera_id] = now_ts
 
     event_id = update.id if update.model_key == "event" else None
-    await _send_notification(result, camera_id, camera_name, sd_types, snapshot, event_id)
+    await _send_notification(result, camera_id, camera_name, sd_types, snapshot, event_id, matched_pets)
 
 
 async def _send_notification(
@@ -241,6 +244,7 @@ async def _send_notification(
     sd_types: list[str],
     snapshot: bytes,
     event_id: str | None = None,
+    matched_pets: list[str] | None = None,
 ) -> None:
     if event_id:
         click_url = f"https://{state.settings.unifi_host}/protect/events/{event_id}"
@@ -257,9 +261,16 @@ async def _send_notification(
             click_url=click_url,
         )
     elif result.decision == Decision.NOTIFY_ANIMAL:
+        pets = matched_pets or []
+        if pets:
+            title = f"{', '.join(pets)} vid {camera_name}"
+            msg = f"Känt husdjur: {', '.join(pets)}"
+        else:
+            title = f"Okänt djur vid {camera_name}"
+            msg = "Smart detection: " + ", ".join(sd_types)
         await state.notifier.send(
-            title=f"Djur vid {camera_name}",
-            message="Smart detection: " + ", ".join(sd_types),
+            title=title,
+            message=msg,
             priority=2,
             tags=["paw_prints"],
             image_bytes=snapshot,
@@ -438,25 +449,43 @@ async def _track_and_analyze(
     return traj_matches, unmatched, skel_matches
 
 
-def _detect_and_save_pets(snapshot: bytes, camera: str) -> None:
-    """Run YOLO on snapshot, save any animal detections to the unknown_pets queue."""
+def _detect_and_save_pets(snapshot: bytes, camera: str) -> list[str]:
+    """Run YOLO on snapshot, match against known pets, save unknowns for labeling.
+
+    Returns list of matched pet names.
+    """
     from datetime import UTC, datetime
 
     try:
         pets = state.pet_detector.detect(snapshot)
     except Exception as exc:  # noqa: BLE001
         log.warning("pet_detect_failed", error=str(exc), camera=camera)
-        return
+        return []
     if not pets:
         log.info("pet_event_no_yolo_match", camera=camera)
-        return
+        return []
 
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     pet_dir = state.settings.data_dir / "unknown_pets"
     pet_dir.mkdir(parents=True, exist_ok=True)
+    matched_names: list[str] = []
 
     for idx, pet in enumerate(pets):
         crop_bytes = PetDetector.crop(snapshot, pet.bbox)
+        embedding = state.pet_reid.embed(crop_bytes)
+        match = state.pet_reid.match(embedding)
+
+        if match.is_known:
+            log.info(
+                "pet_matched",
+                camera=camera,
+                subject=match.matched_subject,
+                species=pet.species,
+                similarity=round(match.similarity, 3),
+            )
+            matched_names.append(match.matched_subject or pet.species)
+            continue
+
         crop_filename = f"{timestamp}_{camera}_{pet.species}_{idx}_crop.jpg"
         snap_filename = f"{timestamp}_{camera}_{pet.species}_{idx}_snap.jpg"
         (pet_dir / crop_filename).write_bytes(crop_bytes)
@@ -471,8 +500,15 @@ def _detect_and_save_pets(snapshot: bytes, camera: str) -> None:
             width_px=pet.width_px,
             height_px=pet.height_px,
         )
-        log.info("pet_detected", camera=camera, species=pet.species,
-                 confidence=round(pet.confidence, 2))
+        log.info(
+            "pet_unknown",
+            camera=camera,
+            species=pet.species,
+            confidence=round(pet.confidence, 2),
+            best_similarity=round(match.similarity, 3),
+        )
+
+    return matched_names
 
 
 def _save_unknown_faces(faces: list, snapshot: bytes, camera: str) -> None:
@@ -542,6 +578,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     state.pet_db = PetDB(settings.data_dir / "pets.db")
     state.pet_detector = PetDetector()
+    state.pet_reid = PetReID()
+    pet_known = state.pet_db.all_known_by_subject()
+    state.pet_reid.reload(pet_known, state.pet_db.species_by_subject())
     state.body_db = BodyDB(settings.data_dir / "bodies.db")
     state.body_reid = BodyReID(similarity_threshold=settings.body_similarity_threshold)
     body_known = state.body_db.all_known_by_subject()
@@ -562,6 +601,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         trajectory_cameras=list(traj_known.keys()),
         skeleton_subjects=list(skel_known.keys()),
         skeleton_profiles=sum(len(v) for v in skel_known.values()),
+        pet_subjects=list(pet_known.keys()),
+        pet_embeddings=sum(len(v) for v in pet_known.values()),
     )
     state.protect = ProtectClient(
         host=settings.unifi_host,
@@ -644,10 +685,12 @@ async def reload_all(s: Annotated[AppState, Depends(_get_state)]) -> dict:
     s.body_reid.reload(s.body_db.all_known_by_subject())
     s.trajectory_matcher.reload(s.trajectory_db.known_by_camera())
     s.skeleton_matcher.reload(s.skeleton_db.known_by_subject())
+    s.pet_reid.reload(s.pet_db.all_known_by_subject(), s.pet_db.species_by_subject())
     return {
         "face_subjects": s.recognizer.known_subjects(),
         "body_subjects": list(s.body_db.all_known_by_subject().keys()),
         "skeleton_subjects": list(s.skeleton_db.known_by_subject().keys()),
+        "pet_subjects": list(s.pet_db.all_known_by_subject().keys()),
     }
 
 
@@ -809,10 +852,14 @@ async def label_unknown_pet(
     crop_src = s.settings.data_dir / "unknown_pets" / row.crop_filename
     known_dir = s.settings.data_dir / "pets" / subject
     known_dir.mkdir(parents=True, exist_ok=True)
+    embedding = None
     if crop_src.exists():
-        (known_dir / row.crop_filename).write_bytes(crop_src.read_bytes())
-    db_id = s.pet_db.add_known(subject, row.species, row.crop_filename)
+        crop_bytes = crop_src.read_bytes()
+        (known_dir / row.crop_filename).write_bytes(crop_bytes)
+        embedding = s.pet_reid.embed(crop_bytes)
+    db_id = s.pet_db.add_known(subject, row.species, row.crop_filename, embedding)
     s.pet_db.mark_labeled(pet_id)
+    s.pet_reid.reload(s.pet_db.all_known_by_subject(), s.pet_db.species_by_subject())
     return {"known_id": db_id, "subject": subject, "species": row.species}
 
 
@@ -1110,6 +1157,72 @@ async def analyze_event_skeleton(
     }
 
 
+@app.post("/api/pets/backfill")
+async def backfill_pets(
+    s: Annotated[AppState, Depends(_get_state)],
+    days: int = 30,
+    limit: int = 500,
+) -> dict[str, int]:
+    """Scan Protect event thumbnails with YOLO to find animals Protect missed."""
+    import time as _time
+    from datetime import UTC, datetime
+
+    now_ms = int(_time.time() * 1000)
+    start_ms = now_ms - days * 24 * 3600 * 1000
+    events = await s.protect.list_events(
+        start_ms, now_ms, types=["smartDetectZone", "motion"], limit=limit,
+    )
+    log.info("pet_backfill_started", days=days, events=len(events))
+
+    pet_dir = s.settings.data_dir / "unknown_pets"
+    pet_dir.mkdir(parents=True, exist_ok=True)
+    found = 0
+    scanned = 0
+
+    for ev in events:
+        event_id = ev.get("id")
+        camera_id = ev.get("camera", "")
+        if not event_id:
+            continue
+        thumb = await s.protect.fetch_event_thumbnail(event_id)
+        if thumb is None or len(thumb) < 1000:
+            continue
+        scanned += 1
+        try:
+            pets = s.pet_detector.detect(thumb)
+        except Exception:  # noqa: BLE001
+            continue
+        if not pets:
+            continue
+
+        camera_name = s.protect.camera_name(camera_id)
+        ts = datetime.fromtimestamp(ev.get("start", now_ms) / 1000, UTC)
+        timestamp = ts.strftime("%Y%m%dT%H%M%S")
+
+        for idx, pet in enumerate(pets):
+            crop_bytes = PetDetector.crop(thumb, pet.bbox)
+            crop_filename = f"backfill_{timestamp}_{camera_name}_{pet.species}_{idx}_crop.jpg"
+            snap_filename = f"backfill_{timestamp}_{camera_name}_{pet.species}_{idx}_snap.jpg"
+            (pet_dir / crop_filename).write_bytes(crop_bytes)
+            (pet_dir / snap_filename).write_bytes(thumb)
+            s.pet_db.add_unknown(
+                camera=camera_name,
+                species=pet.species,
+                confidence=pet.confidence,
+                crop_filename=crop_filename,
+                snapshot_filename=snap_filename,
+                bbox=pet.bbox,
+                width_px=pet.width_px,
+                height_px=pet.height_px,
+            )
+            found += 1
+            log.info("pet_backfill_found", camera=camera_name, species=pet.species,
+                     confidence=round(pet.confidence, 2), event_time=timestamp)
+
+    log.info("pet_backfill_done", scanned=scanned, found=found)
+    return {"events_scanned": scanned, "pets_found": found}
+
+
 @app.post("/api/backfill")
 async def backfill_old_events(
     s: Annotated[AppState, Depends(_get_state)],
@@ -1272,6 +1385,10 @@ _INLINE_HTML = """<!doctype html>
 
 <h2>Okända djur</h2>
 <div class="known" id="known-pets"></div>
+<div style="margin-bottom:1rem">
+  <button onclick="backfillPets()">Sök djur i historik (30 dagar)</button>
+  <span id="pet-backfill-status" style="color:#888;margin-left:0.5rem"></span>
+</div>
 <div class="grid" id="grid-pets"></div>
 
 <script>
@@ -1474,6 +1591,15 @@ _INLINE_HTML = """<!doctype html>
   function skipEvent(eventId) {
     const card = document.getElementById('ev-' + eventId);
     card.remove();
+  }
+
+  async function backfillPets() {
+    const status = document.getElementById('pet-backfill-status');
+    status.textContent = 'Söker djur i gamla events...';
+    const r = await fetch('/api/pets/backfill?days=30&limit=500', {method: 'POST'});
+    const d = await r.json();
+    status.textContent = `Klart: ${d.pets_found} djur hittade i ${d.events_scanned} events`;
+    await loadPets();
   }
 
   async function refresh() {
