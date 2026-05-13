@@ -54,6 +54,7 @@ class NtfyNotifier:
         tags: list[str] | None = None,
         image_bytes: bytes | None = None,
         click_url: str | None = None,
+        actions: str | None = None,
     ) -> bool:
         """Send a single NTFY notification with optional image attachment.
 
@@ -69,6 +70,8 @@ class NtfyNotifier:
             headers["X-Tags"] = _encode_header(",".join(tags))
         if click_url:
             headers["X-Click"] = click_url
+        if actions:
+            headers["X-Actions"] = actions
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:

@@ -262,10 +262,12 @@ async def _send_notification(
     matched_pets: list[str] | None = None,
     matched_vehicles: list[str] | None = None,
 ) -> None:
+    watcher_url = f"http://watcher.bloomer.se"
     if event_id:
-        click_url = f"https://{state.settings.unifi_host}/protect/events/{event_id}"
+        protect_url = f"https://{state.settings.unifi_host}/protect/events/{event_id}"
     else:
-        click_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
+        protect_url = f"https://{state.settings.unifi_host}/protect/cameras/{camera_id}"
+    actions = f"view, Watcher, {watcher_url}; view, Protect, {protect_url}"
 
     if result.decision == Decision.ALERT:
         is_vehicle_alert = "vehicle" in sd_types and not matched_vehicles
@@ -280,7 +282,8 @@ async def _send_notification(
             priority=4,
             tags=["warning", "car" if is_vehicle_alert else "house"],
             image_bytes=snapshot,
-            click_url=click_url,
+            click_url=watcher_url,
+            actions=actions,
         )
     elif result.decision == Decision.NOTIFY_ANIMAL:
         pets = matched_pets or []
@@ -296,7 +299,8 @@ async def _send_notification(
             priority=2,
             tags=["paw_prints"],
             image_bytes=snapshot,
-            click_url=click_url,
+            click_url=watcher_url,
+            actions=actions,
         )
 
 
